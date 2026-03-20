@@ -18,14 +18,12 @@
     45
   ],
   "selected_batteries": [
-    "BAT_FPV_4S1P",
-    "BAT_MICRO_1S",
-    "BAT_MID_6S2P",
-    "BAT_MID_6S4P",
-    "BAT_AG_6S1P",
-    "BAT_HLIFT_6S2P",
     "BAT_LE_12S2P",
-    "BAT_SSS_6S1P"
+    "GREPOW_TATTU_12S_LIPO_DRONE_BATTERY",
+    "GREPOW_TATTU_12S_10000MAH_44_4V_30C_LIPO_BATTERY",
+    "TATTU_TATTU_PLUS_1_0_COMPACT_VERSION_10000MAH_44_4",
+    "GREPOW_TATTU_PLUS_1_0_12S_10000MAH_44_4V_15C_LIPO_",
+    "TATTU_TATTU_SEMI_SOLID_STATE_330WH_KG_25000MAH_10C"
   ],
   "battery_combination": null,
   "combined_pack_id": null

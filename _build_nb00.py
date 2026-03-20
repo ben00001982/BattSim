@@ -1,4 +1,4 @@
-"""Build notebooks/08_battery_selector.ipynb"""
+"""Build notebooks/00_battery_selector.ipynb"""
 import json, sys
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -44,8 +44,8 @@ plt.rcParams.update({'figure.dpi': 120, 'font.size': 10,
                      'axes.grid': True, 'grid.alpha': 0.25})
 
 DB_PATH = '../battery_db.xlsx'
-db = BatteryDatabase()
-db.load(DB_PATH) if os.path.exists(DB_PATH) else db.load()
+db = BatteryDatabase(DB_PATH) if os.path.exists(DB_PATH) else BatteryDatabase()
+db.load()
 
 print(f'Catalogue loaded: {len(db.packs)} battery packs')
 print(f'Chemistries available: {sorted(set(p.chemistry_id for p in db.packs.values()))}')
@@ -147,7 +147,8 @@ df_filtered = filter_packs(
     max_weight_g=MAX_WEIGHT_G,
 )
 
-print(f'{len(df_filtered)} pack(s) match the criteria:\n')
+print(f'{len(df_filtered)} pack(s) match the criteria:')
+print()
 if df_filtered.empty:
     print('  No packs match. Try relaxing the filters.')
 else:
@@ -296,7 +297,7 @@ nb = {
     'cells': cells,
 }
 
-out_path = 'notebooks/08_battery_selector.ipynb'
+out_path = 'notebooks/00_battery_selector.ipynb'
 with open(out_path, 'w', encoding='utf-8') as f:
     json.dump(nb, f, indent=1, ensure_ascii=False)
 print(f'Written: {out_path}  ({len(cells)} cells)')
