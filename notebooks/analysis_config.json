@@ -1,0 +1,32 @@
+{
+  "uav_id": "HEX_SURVEY_900",
+  "custom_equipment": {},
+  "mission_id": "SURVEY_STD",
+  "ambient_temp_c": 25.0,
+  "temp_sweep": [
+    -10,
+    -5,
+    0,
+    5,
+    10,
+    15,
+    20,
+    25,
+    30,
+    35,
+    40,
+    45
+  ],
+  "selected_batteries": [
+    "BAT_FPV_4S1P",
+    "BAT_MICRO_1S",
+    "BAT_MID_6S2P",
+    "BAT_MID_6S4P",
+    "BAT_AG_6S1P",
+    "BAT_HLIFT_6S2P",
+    "BAT_LE_12S2P",
+    "BAT_SSS_6S1P"
+  ],
+  "battery_combination": null,
+  "combined_pack_id": null
+}

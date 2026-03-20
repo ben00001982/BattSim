@@ -281,7 +281,9 @@ def terminal_voltage(
             break
         v_est = v_new
 
-    v_term  = max(0.1, v_est)
+    # Clamp to a small positive value to prevent division-by-zero;
+    # callers should check against pack voltage cutoff to detect depletion.
+    v_term  = max(0.5, v_est)
     current = power_w / v_term
 
     dv_ohm_f  = current * r_ohm  / 1000.0

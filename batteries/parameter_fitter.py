@@ -113,30 +113,157 @@ def _r_squared(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 # ── Stage 1 — Internal resistance ────────────────────────────────────────────
 
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    """Return weighted median of values."""
+    order    = np.argsort(values)
+    w_sorted = weights[order]
+    w_cum    = np.cumsum(w_sorted) / w_sorted.sum()
+    return float(values[order][np.searchsorted(w_cum, 0.5)])
+
+
+def _sag_r2(v: np.ndarray, i: np.ndarray, soc: np.ndarray, r_mohm: float) -> float:
+    """
+    Compute R² of the IR sag model in the *sag domain*.
+
+    Classic R² on raw terminal voltage is always poor because OCV drift
+    (due to SoC change over the flight) dominates the variance and has
+    nothing to do with IR fit quality.
+
+    Instead we:
+      1. Estimate V_ocv at every sample by fitting a smooth polynomial
+         of (V_terminal + I*R) vs SoC — this removes OCV variation.
+      2. Compute measured sag:  V_sag_meas = V_ocv_smooth − V_terminal
+      3. Compute predicted sag: V_sag_pred = I × R / 1000
+      4. Return R²(V_sag_meas, V_sag_pred).
+    """
+    if soc is None or len(soc) != len(v):
+        return 0.0
+    soc_range = float(soc.max() - soc.min())
+    if soc_range < 5.0:
+        return 0.0
+    v_ocv_est = v + i * r_mohm / 1000.0
+    try:
+        deg = min(4, max(1, int(soc_range / 15)))
+        coeffs    = np.polyfit(soc, v_ocv_est, deg)
+        v_ocv_fit = np.polyval(coeffs, soc)
+    except Exception:
+        return 0.0
+    v_sag_meas = v_ocv_fit - v
+    v_sag_pred = i * r_mohm / 1000.0
+    valid = v_sag_meas > 0.001
+    if valid.sum() < 10:
+        return 0.0
+    return _r_squared(v_sag_meas[valid], v_sag_pred[valid])
+
+
+def _delta_vi_estimates(v: np.ndarray, i: np.ndarray, t: np.ndarray,
+                         valid: np.ndarray, min_di: float = 3.0,
+                         max_dt: float = 4.0) -> np.ndarray:
+    """
+    ΔV/ΔI method: for consecutive sample pairs where current changes rapidly,
+    OCV barely changes so ΔV ≈ −R × ΔI.  Much less sensitive to OCV drift
+    than whole-flight regression.
+    """
+    r_vals = []
+    idxs = np.where(valid)[0]
+    for k in range(len(idxs) - 1):
+        a, b = idxs[k], idxs[k + 1]
+        if t[b] - t[a] > max_dt:
+            continue
+        di = float(i[b] - i[a])
+        dv = float(v[b] - v[a])
+        if abs(di) < min_di:
+            continue
+        if di * dv >= 0:          # must be opposing (more I → less V)
+            continue
+        r = -dv / di * 1000.0
+        if 1.0 < r < 600.0:
+            r_vals.append(r)
+    return np.array(r_vals) if r_vals else np.array([])
+
+
+def _detrended_window_estimates(v: np.ndarray, i: np.ndarray, t: np.ndarray,
+                                 valid: np.ndarray,
+                                 window_s: float = 5.0) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Improved window regression: remove the linear OCV drift within each
+    short window before regressing V against I.  The residual V after
+    detrending is dominated by R×I, not by OCV(SoC).
+    """
+    r_vals, weights = [], []
+    t_starts = np.arange(t[valid][0], t[valid][-1], window_s / 2) if valid.sum() > 0 else []
+    for win_start in t_starts:
+        win = valid & (t >= win_start) & (t < win_start + window_s)
+        if win.sum() < 8:
+            continue
+        v_w = v[win]; i_w = i[win]; t_w = t[win]
+        if i_w.max() - i_w.min() < 1.0:
+            continue
+        # Remove linear OCV trend within window (V drift due to SoC depletion)
+        t_c = t_w - t_w.mean()
+        try:
+            trend = np.polyfit(t_c, v_w, 1)
+        except Exception:
+            continue
+        v_detrended = v_w - np.polyval(trend, t_c)
+        i_centered  = i_w - i_w.mean()
+        if i_centered.max() - i_centered.min() < 0.5:
+            continue
+        try:
+            coeffs = np.polyfit(i_centered, v_detrended, 1)
+        except Exception:
+            continue
+        slope = coeffs[0]
+        if slope >= -0.0005:
+            continue
+        r_est = -slope * 1000.0
+        if not (1.0 < r_est < 600.0):
+            continue
+        y_pred = np.polyval(coeffs, i_centered)
+        r2_win = _r_squared(v_detrended, y_pred)
+        if r2_win <= 0:
+            continue
+        r_vals.append(r_est)
+        weights.append((i_w.max() - i_w.min()) * r2_win)
+    if not r_vals:
+        return np.array([]), np.array([])
+    return np.array(r_vals), np.array(weights)
+
+
 def fit_internal_resistance(
     log: FlightLog,
     soc_bins: int = 5,
     i_min_a: float = 2.0,
     i_max_a: float = None,
     temp_filter_c: Optional[tuple[float, float]] = None,
-    method: str = "window",   # 'window' (default), 'regression', 'step_response'
+    method: str = "auto",   # 'auto' (default), 'delta_vi', 'detrended_window', 'window', 'step_response'
 ) -> FitResult:
     """
     Fit pack internal resistance from flight log data.
 
-    Preferred method — 'window' (30-second rolling windows):
-      Within each short window, SoC barely changes, so V ≈ V_ocv_const − I×R.
-      Linear regression within each window gives slope = −R.
-      Final estimate = weighted median across all valid windows.
+    method='auto' (default): Tries three methods and selects the one with
+      the highest sag-domain R² (see _sag_r2).  Reports which was chosen.
 
-    'step_response': Uses rapid current transitions (dI/dt > threshold).
-      Best for logs with many throttle changes. Falls back to 'window'.
+    method='delta_vi': ΔV/ΔI on consecutive sample pairs where current
+      changes significantly.  Immune to OCV drift — best when the log has
+      frequent throttle steps.
+
+    method='detrended_window': 15-second windows with OCV drift removed by
+      linear detrending before V–I regression.  Better than raw 'window'.
+
+    method='window': Original 30-second rolling window regression (legacy).
+
+    method='step_response': Explicit dI/dt threshold detection (legacy).
+
+    R² is computed in the *sag domain* (V_sag_pred vs V_sag_meas) rather
+    than on raw terminal voltage, so it reflects actual fit quality rather
+    than being dominated by OCV variation across the flight.
     """
     v    = _to_arr(log.voltage_v)
     i    = _to_arr(log.current_a)
     t    = _to_arr(log.time_s)
     temp = _to_arr(log.temp_c)
-    soc  = _to_arr(log.soc_pct) if log.soc_pct else np.linspace(100, 0, len(v))
+    soc  = _to_arr(log.soc_pct) if log.soc_pct else None
 
     valid = (v > 3.0) & (i >= i_min_a) & np.isfinite(v) & np.isfinite(i)
     if temp_filter_c:
@@ -148,116 +275,111 @@ def fit_internal_resistance(
     if valid.sum() < 20:
         return FitResult("R_internal_mohm", 0.0, notes="Insufficient data for IR fit")
 
-    # ── Try step-response first if explicitly requested ───────────────────────
-    if method == "step_response":
-        di = np.diff(i)
-        dv = np.diff(v)
-        dt_diff = np.diff(t)
-        dt_diff = np.where(dt_diff < 0.001, 0.001, dt_diff)
-        didt = np.abs(di / dt_diff)
-        step_mask = didt > 15.0
-        if step_mask.sum() >= 5:
-            idx = np.where(step_mask)[0]
-            dv_s = dv[idx]
-            di_s = di[idx]
-            ok   = (di_s * dv_s < 0) & (np.abs(di_s) > 1.0)
-            if ok.sum() >= 5:
-                r_vals = -dv_s[ok] / di_s[ok] * 1000.0
-                r_clean = r_vals[(r_vals > 0) & (r_vals < 500)]
-                if len(r_clean) >= 3:
-                    r_med = float(np.median(r_clean))
-                    r_std = float(np.std(r_clean))
-                    return FitResult(
-                        "R_internal_mohm", round(r_med, 3), round(r_std, 3),
-                        r_squared=0.0, n_samples=len(r_clean),
-                        method="step_response",
-                        notes=f"Median of {len(r_clean)} dI/dt events",
-                    )
-        # Fall through to window method
-
-    # ── Window regression (30-second windows) ────────────────────────────────
-    window_s = 30.0
-    r_vals, weights = [], []
-    t_start = t[valid][0] if valid.sum() > 0 else 0
-
-    for win_start in np.arange(t_start, t[-1], window_s / 2):
-        win_mask = valid & (t >= win_start) & (t < win_start + window_s)
-        if win_mask.sum() < 8:
-            continue
-        v_w = v[win_mask]
-        i_w = i[win_mask]
-        i_range = float(i_w.max() - i_w.min())
-        if i_range < 1.0:
-            continue  # not enough current variation to regress
-        if HAS_SCIPY:
-            slope, _, r_val, _, se = linregress(i_w, v_w)
-        else:
-            coeffs = np.polyfit(i_w, v_w, 1)
-            slope  = coeffs[0]
-            y_pred = np.polyval(coeffs, i_w)
-            r_val  = math.sqrt(max(0, _r_squared(v_w, y_pred)))
-            se     = abs(slope) * 0.05
-        if slope < -0.0005:
-            r_est = -slope * 1000.0
-            if 1.0 < r_est < 600.0:
-                r_vals.append(r_est)
-                # Weight by current range × R² (better signal = more weight)
-                r2_w = float(r_val) ** 2 if HAS_SCIPY else 0.5
-                weights.append(i_range * max(0.01, r2_w))
-
-    if len(r_vals) < 3:
-        # Last resort: overall regression on equal-SoC bands
-        r_band = []
-        for band_lo in range(0, 100, 20):
-            mask_b = valid & (soc >= band_lo) & (soc < band_lo + 20)
-            if mask_b.sum() < 15:
-                continue
-            if HAS_SCIPY:
-                slope, _, r_v, _, _ = linregress(i[mask_b], v[mask_b])
-            else:
-                coeffs = np.polyfit(i[mask_b], v[mask_b], 1)
-                slope  = coeffs[0]
-            if slope < -0.0005:
-                r_band.append(-slope * 1000)
-        if r_band:
-            r_vals   = r_band
-            weights  = [1.0] * len(r_band)
-
-    if not r_vals:
-        return FitResult("R_internal_mohm", 0.0, notes="No valid windows for IR fit")
-
-    r_arr = np.array(r_vals)
-    w_arr = np.array(weights)
-
-    # Weighted median (robust to outliers)
-    sorted_idx = np.argsort(r_arr)
-    r_sorted   = r_arr[sorted_idx]
-    w_sorted   = w_arr[sorted_idx]
-    w_cum      = np.cumsum(w_sorted) / w_sorted.sum()
-    r_med      = float(r_sorted[np.searchsorted(w_cum, 0.5)])
-    r_std      = float(np.std(r_arr))
-
-    # Normalise to 25°C
+    # Temperature info for normalisation note
     t_valid_arr = temp[valid & (temp > -50)]
     t_mean = float(np.mean(t_valid_arr)) if len(t_valid_arr) > 5 else 25.0
-    if abs(t_mean - 25.0) > 3:
-        from batteries.voltage_model import arrhenius_scale, CHEM_VOLTAGE_PARAMS
-        params = CHEM_VOLTAGE_PARAMS.get("LION21")
-        r_med  = r_med / arrhenius_scale(params.B_ohmic_K, t_mean)
-        notes  = f"T_avg={t_mean:.1f}°C, normalised to 25°C ref. {len(r_vals)} windows"
-    else:
-        notes = f"T_avg≈{t_mean:.1f}°C. {len(r_vals)} 30-s windows"
 
-    # Overall R² against all valid data
-    v_pred = -r_med / 1000.0 * i[valid] + np.median(v[valid]) + r_med / 1000.0 * np.median(i[valid])
-    r2_overall = _r_squared(v[valid], v_pred)
+    def _normalise_to_25c(r_mohm: float) -> float:
+        if abs(t_mean - 25.0) > 3:
+            from batteries.voltage_model import arrhenius_scale, CHEM_VOLTAGE_PARAMS
+            params = CHEM_VOLTAGE_PARAMS.get("LION21")
+            return r_mohm / arrhenius_scale(params.B_ohmic_K, t_mean)
+        return r_mohm
+
+    candidates = {}  # method_name → (r_med, r_std, n, sag_r2, note)
+
+    # ── Method 1: ΔV/ΔI on current steps ─────────────────────────────────────
+    if method in ("auto", "delta_vi"):
+        r_dv = _delta_vi_estimates(v, i, t, valid, min_di=3.0, max_dt=4.0)
+        if len(r_dv) >= 5:
+            r_med = float(np.median(r_dv))
+            r_med = _normalise_to_25c(r_med)
+            r2    = _sag_r2(v[valid], i[valid],
+                            soc[valid] if soc is not None else None, r_med)
+            candidates["delta_vi"] = (
+                r_med, float(np.std(r_dv)), len(r_dv), r2,
+                f"ΔV/ΔI on {len(r_dv)} current steps, T_avg={t_mean:.1f}°C"
+            )
+
+    # ── Method 2: Detrended window regression ─────────────────────────────────
+    if method in ("auto", "detrended_window"):
+        r_dw, w_dw = _detrended_window_estimates(v, i, t, valid, window_s=5.0)
+        if len(r_dw) >= 3:
+            r_med = _weighted_median(r_dw, w_dw)
+            r_med = _normalise_to_25c(r_med)
+            r2    = _sag_r2(v[valid], i[valid],
+                            soc[valid] if soc is not None else None, r_med)
+            candidates["detrended_window"] = (
+                r_med, float(np.std(r_dw)), len(r_dw), r2,
+                f"{len(r_dw)} detrended 15-s windows, T_avg={t_mean:.1f}°C"
+            )
+
+    # ── Method 3: Original 5-s window regression (fallback) ───────────────────
+    if method in ("auto", "window", "step_response") or not candidates:
+        window_s = 5.0
+        r_vals, weights = [], []
+        t_start = t[valid][0] if valid.sum() > 0 else 0
+        for win_start in np.arange(t_start, t[-1], window_s / 2):
+            win_mask = valid & (t >= win_start) & (t < win_start + window_s)
+            if win_mask.sum() < 8:
+                continue
+            v_w = v[win_mask]; i_w = i[win_mask]
+            i_range = float(i_w.max() - i_w.min())
+            if i_range < 1.0:
+                continue
+            if HAS_SCIPY:
+                slope, _, r_val, _, _ = linregress(i_w, v_w)
+                r2_w = float(r_val) ** 2
+            else:
+                coeffs = np.polyfit(i_w, v_w, 1)
+                slope  = coeffs[0]
+                r2_w   = max(0.01, _r_squared(v_w, np.polyval(coeffs, i_w)))
+            if slope < -0.0005:
+                r_est = -slope * 1000.0
+                if 1.0 < r_est < 600.0:
+                    r_vals.append(r_est)
+                    weights.append(i_range * max(0.01, r2_w))
+
+        if len(r_vals) < 3:
+            # SoC-band fallback
+            soc_proxy = soc if soc is not None else np.linspace(100, 0, len(v))
+            for band_lo in range(0, 100, 20):
+                mask_b = valid & (soc_proxy >= band_lo) & (soc_proxy < band_lo + 20)
+                if mask_b.sum() < 15:
+                    continue
+                coeffs = np.polyfit(i[mask_b], v[mask_b], 1)
+                if coeffs[0] < -0.0005:
+                    r_vals.append(-coeffs[0] * 1000)
+                    weights.append(1.0)
+
+        if r_vals:
+            r_arr = np.array(r_vals); w_arr = np.array(weights)
+            r_med = _weighted_median(r_arr, w_arr)
+            r_med = _normalise_to_25c(r_med)
+            r2    = _sag_r2(v[valid], i[valid],
+                            soc[valid] if soc is not None else None, r_med)
+            candidates["window"] = (
+                r_med, float(np.std(r_arr)), len(r_vals), r2,
+                f"{len(r_vals)} 30-s windows, T_avg={t_mean:.1f}°C"
+            )
+
+    if not candidates:
+        return FitResult("R_internal_mohm", 0.0, notes="No valid windows for IR fit")
+
+    # ── Select best candidate by sag R² ───────────────────────────────────────
+    best_method = max(candidates, key=lambda k: candidates[k][3])
+    r_med, r_std, n_used, r2_sag, note = candidates[best_method]
+
+    if method == "auto" and len(candidates) > 1:
+        r2_summary = "  ".join(f"{m}:R²={v[3]:.3f}" for m, v in candidates.items())
+        note += f"  [auto selected {best_method} — {r2_summary}]"
 
     return FitResult(
         "R_internal_mohm", round(r_med, 3), round(r_std, 3),
-        r_squared=round(r2_overall, 4),
+        r_squared=round(r2_sag, 4),
         n_samples=int(valid.sum()),
-        method=f"window_regression({len(r_vals)} windows)",
-        notes=notes,
+        method=best_method,
+        notes=note,
     )
 
 

@@ -164,17 +164,36 @@ class Equipment:
     active: bool = True
 
     def power_for_phase(self, phase_type: str) -> float:
-        """Return nominal power draw for a given flight phase."""
+        """Return nominal power draw for a given flight phase.
+
+        Standard phases:
+            IDLE, TAKEOFF, CLIMB, CRUISE, HOVER, DESCEND, LAND,
+            PAYLOAD_OPS, EMERGENCY
+
+        Fixed-wing VTOL phases:
+            VTOL_TRANSITION  — lift+thrust overlap during transition (~80% max)
+            VTOL_HOVER       — dedicated multirotor hover (same as HOVER)
+            FW_CRUISE        — fixed-wing efficient cruise (lower than rotor cruise)
+            FW_CLIMB         — fixed-wing powered climb
+            FW_DESCEND       — fixed-wing glide descent (minimal power)
+        """
         phase_map = {
-            "IDLE":        self.idle_power_w,
-            "TAKEOFF":     self.max_power_w,
-            "CLIMB":       self.climb_power_w,
-            "CRUISE":      self.cruise_power_w,
-            "HOVER":       self.hover_power_w,
-            "DESCEND":     self.cruise_power_w * 0.7,
-            "LAND":        self.hover_power_w * 0.85,
-            "PAYLOAD_OPS": self.hover_power_w,
-            "EMERGENCY":   self.max_power_w,
+            # ── Standard multirotor phases ────────────────────────────────────
+            "IDLE":            self.idle_power_w,
+            "TAKEOFF":         self.max_power_w,
+            "CLIMB":           self.climb_power_w,
+            "CRUISE":          self.cruise_power_w,
+            "HOVER":           self.hover_power_w,
+            "DESCEND":         self.cruise_power_w * 0.70,
+            "LAND":            self.hover_power_w * 0.85,
+            "PAYLOAD_OPS":     self.hover_power_w,
+            "EMERGENCY":       self.max_power_w,
+            # ── Fixed-wing VTOL phases ────────────────────────────────────────
+            "VTOL_TRANSITION": self.max_power_w * 0.80,   # lift+forward thrust overlap
+            "VTOL_HOVER":      self.hover_power_w,         # explicit hover label
+            "FW_CRUISE":       self.cruise_power_w * 0.45, # efficient fixed-wing cruise
+            "FW_CLIMB":        self.climb_power_w * 0.70,  # fixed-wing climb
+            "FW_DESCEND":      self.idle_power_w,          # glide/near-idle descent
         }
         return phase_map.get(phase_type.upper(), self.cruise_power_w)
 
@@ -234,6 +253,7 @@ class MissionPhase:
     phase_seq: int
     phase_name: str
     phase_type: str          # IDLE / TAKEOFF / CLIMB / CRUISE / HOVER / DESCEND / LAND / PAYLOAD_OPS / EMERGENCY
+                             # VTOL: VTOL_TRANSITION / VTOL_HOVER / FW_CRUISE / FW_CLIMB / FW_DESCEND
     duration_s: float
     distance_m: float = 0.0
     altitude_m: float = 0.0

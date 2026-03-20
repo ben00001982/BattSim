@@ -64,8 +64,9 @@ class SimulationResult:
     phase_type: list[str] = field(default_factory=list)
 
     # ── Terminal flags ──
-    depleted:   bool = False
+    depleted:      bool = False
     cutoff_time_s: Optional[float] = None
+    cutoff_reason: str = ""   # "soc" | "voltage" | ""
 
     # ── Derived metrics ──────────────────────────────────────────────────────
 
@@ -117,7 +118,8 @@ class SimulationResult:
             f"  Peak temperature : {self.max_temp_c:.1f} °C",
         ]
         if self.depleted and self.cutoff_time_s:
-            lines.append(f"  ⚠ Depleted at     : {self.cutoff_time_s:.0f} s")
+            reason = f" [{self.cutoff_reason} cutoff]" if self.cutoff_reason else ""
+            lines.append(f"  \u26a0 Depleted at     : {self.cutoff_time_s:.0f} s{reason}")
         return "\n".join(lines)
 
 
@@ -265,10 +267,18 @@ def run_simulation(
 
             t += dt_s
 
-            # ── 6. Depletion check ──
+            # ── 6. Depletion checks ──
+            # SoC floor
             if soc <= cutoff_soc_pct:
                 result.depleted = True
                 result.cutoff_time_s = t
+                result.cutoff_reason = "soc"
+                return result
+            # Voltage cutoff — catches cold-weather IR-induced collapse
+            if v_term < pack.pack_voltage_cutoff:
+                result.depleted = True
+                result.cutoff_time_s = t
+                result.cutoff_reason = "voltage"
                 return result
 
     return result

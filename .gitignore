@@ -26,6 +26,7 @@ ENV/
 # Outputs — generated files, not source
 notebooks/*.png
 notebooks/*.csv
+notebooks/*.pdf
 notebooks/UAV_Battery_Report.xlsx
 notebooks/*_simulation.csv
 notebooks/*_power_profile.csv

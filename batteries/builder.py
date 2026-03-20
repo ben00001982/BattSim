@@ -97,6 +97,109 @@ def build_pack(
     )
 
 
+def combine_packs(
+    packs: list[BatteryPack],
+    topology: str = "series",
+    combined_id: str = "",
+    combined_name: str = "",
+) -> BatteryPack:
+    """
+    Combine multiple identical-chemistry packs into one virtual pack.
+
+    Args:
+        packs:         List of BatteryPack objects to combine.
+        topology:      "series"   — packs in series  (voltages add, capacity same)
+                       "parallel" — packs in parallel (capacities add, voltage same)
+        combined_id:   ID for the combined pack (auto-generated if empty)
+        combined_name: Name for the combined pack (auto-generated if empty)
+
+    Returns:
+        A new BatteryPack representing the combined pack.
+
+    Rules:
+        Series (n packs):
+            V = sum(V_i)           Ah = min(Ah_i)
+            IR = sum(IR_i)         max_I = min(max_I_i)
+
+        Parallel (n packs):
+            V = min(V_i)           Ah = sum(Ah_i)
+            IR = IR_ref / n        max_I = sum(max_I_i)
+    """
+    if not packs:
+        raise ValueError("packs list must not be empty")
+    if len(packs) == 1:
+        return packs[0]
+
+    topo = topology.lower()
+    if topo not in ("series", "parallel"):
+        raise ValueError("topology must be 'series' or 'parallel'")
+
+    n = len(packs)
+
+    if topo == "series":
+        v_nom  = sum(p.pack_voltage_nom    for p in packs)
+        v_max  = sum(p.pack_voltage_max    for p in packs)
+        v_cut  = sum(p.pack_voltage_cutoff for p in packs)
+        cap_ah = min(p.pack_capacity_ah   for p in packs)
+        ir     = sum(p.internal_resistance_mohm for p in packs)
+        i_cont = min(p.max_cont_discharge_a for p in packs)
+        cells_s = sum(p.cells_series   for p in packs)
+        cells_p = packs[0].cells_parallel
+        topo_label = f"{n}S"
+    else:  # parallel
+        v_nom  = min(p.pack_voltage_nom    for p in packs)
+        v_max  = min(p.pack_voltage_max    for p in packs)
+        v_cut  = max(p.pack_voltage_cutoff for p in packs)
+        cap_ah = sum(p.pack_capacity_ah   for p in packs)
+        ir     = packs[0].internal_resistance_mohm / n
+        i_cont = sum(p.max_cont_discharge_a for p in packs)
+        cells_s = packs[0].cells_series
+        cells_p = sum(p.cells_parallel for p in packs)
+        topo_label = f"{n}P"
+
+    energy_wh   = round(v_nom * cap_ah, 1)
+    weight_g    = sum(p.pack_weight_g for p in packs)
+    spec_energy = energy_wh / (weight_g / 1000) if weight_g > 0 else 0
+    p_cont      = round(v_nom * i_cont, 0)
+    c_rate      = round(i_cont / cap_ah, 2) if cap_ah > 0 else 0
+
+    # Volume (optional)
+    vols = [p.pack_volume_cm3 for p in packs]
+    vol  = round(sum(vols), 1) if all(v is not None for v in vols) else None
+    e_den = round(energy_wh / (vol / 1000), 1) if vol else None
+
+    if not combined_id:
+        base = packs[0].battery_id
+        combined_id = f"COMBINED_{base}_{topo_label}"
+    if not combined_name:
+        combined_name = f"Combined {n}× {packs[0].name} [{topo_label}]"
+
+    return BatteryPack(
+        battery_id=combined_id,
+        name=combined_name,
+        cell_id=packs[0].cell_id,
+        chemistry_id=packs[0].chemistry_id,
+        cells_series=cells_s,
+        cells_parallel=cells_p,
+        pack_voltage_nom=round(v_nom, 2),
+        pack_voltage_max=round(v_max, 2),
+        pack_voltage_cutoff=round(v_cut, 2),
+        pack_capacity_ah=round(cap_ah, 2),
+        pack_energy_wh=energy_wh,
+        pack_weight_g=round(weight_g, 1),
+        specific_energy_wh_kg=round(spec_energy, 1),
+        pack_volume_cm3=vol,
+        energy_density_wh_l=e_den,
+        max_cont_discharge_a=round(i_cont, 1),
+        max_cont_discharge_w=p_cont,
+        cont_c_rate=c_rate,
+        internal_resistance_mohm=round(ir, 2),
+        cycle_life=min(p.cycle_life for p in packs),
+        uav_class=packs[0].uav_class,
+        notes=f"Auto-combined: {topo_label} of {[p.battery_id for p in packs]}",
+    )
+
+
 def compare_configurations(
     cell: Cell,
     configs: list[tuple[int, int]],
