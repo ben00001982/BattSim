@@ -32,6 +32,10 @@ notebooks/*_simulation.csv
 notebooks/*_power_profile.csv
 uav_battery_report.xlsx
 
+# Generated reports directory
+reports/
+*.zip
+
 # ArduPilot logs — keep sample logs, exclude real flight data
 logs/*.bin
 logs/*.log

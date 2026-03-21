@@ -558,18 +558,29 @@ def generate_synthetic_log(
     dt_s: float = 1.0,
     noise_v: float = 0.02,
     noise_i: float = 0.5,
+    initial_soc_pct: float = 100.0,
+    peukert_k: float = 1.05,
+    cutoff_soc_pct: float = 10.0,
+    dod_limit_pct: float = 80.0,
 ) -> FlightLog:
     """
     Generate a synthetic FlightLog from a simulation result.
     Useful for testing the parameter fitter without real flight data.
     Adds realistic sensor noise to voltage and current.
+    All simulation parameters match those exposed on the Simulation page.
     """
     import random
     from mission.simulator import run_simulation
 
-    result = run_simulation(pack=pack, mission=mission, uav=uav,
-                            discharge_pts=discharge_pts,
-                            ambient_temp_c=ambient_temp_c, dt_s=dt_s)
+    result = run_simulation(
+        pack=pack, mission=mission, uav=uav,
+        discharge_pts=discharge_pts,
+        ambient_temp_c=ambient_temp_c, dt_s=dt_s,
+        initial_soc_pct=initial_soc_pct,
+        peukert_k=peukert_k,
+        cutoff_soc_pct=cutoff_soc_pct,
+        dod_limit_pct=dod_limit_pct,
+    )
 
     rng = random.Random(42)
     log = FlightLog(source_file="synthetic", log_format="synthetic")
@@ -579,7 +590,7 @@ def generate_synthetic_log(
     for i, t in enumerate(result.time_s):
         v_noisy = result.voltage_v[i] + rng.gauss(0, noise_v)
         i_noisy = max(0, result.current_a[i] + rng.gauss(0, noise_i))
-        dt = dt_s
+        dt = (result.time_s[i] - result.time_s[i - 1]) if i > 0 else dt_s
         mah_cum += i_noisy * dt / 3600 * 1000
         wh_cum  += v_noisy * i_noisy * dt / 3600
 

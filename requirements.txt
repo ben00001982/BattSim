@@ -6,6 +6,7 @@ scipy>=1.11.0
 jupyter>=1.0.0
 notebook>=7.0.0
 ipykernel>=6.0.0
+streamlit>=1.35.0
 
 # Optional: required only for ArduPilot binary .bin log files
 # pymavlink>=2.4.0

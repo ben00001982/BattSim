@@ -540,5 +540,8 @@ def generate_report(
     _build_fitted_params(wb, fitted_params, primary_pack)
 
     wb.save(out_path)
-    print(f"✓ Report saved → {out_path}")
+    try:
+        print(f"[OK] Report saved -> {out_path}")
+    except UnicodeEncodeError:
+        pass
     return out_path
