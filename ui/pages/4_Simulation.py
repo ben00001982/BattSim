@@ -78,10 +78,63 @@ with st.expander("Simulation Parameters", expanded=False):
         dod_limit  = st.slider("DoD limit (%)", 50, 100, 80)
     with c3:
         initial_soc = st.slider("Initial SoC (%)", 80, 100, 100)
+        model_mode_name = st.radio(
+            "Voltage model",
+            ["FAST", "STANDARD", "PRECISE"],
+            index=0,
+            help="FAST: Rint (fastest). STANDARD: 2RC ECM with default params. PRECISE: 2RC ECM with fitted params (requires ECM fitting via Log Analysis).",
+            key="sim_model_mode",
+        )
 
 st.divider()
 
+# ── PRECISE mode pre-run registry check ───────────────────────────────────────
+if model_mode_name == "PRECISE":
+    from batteries.ecm_store import LogRegistry, get_ecm_with_info as _gwi
+    _pre_reg = LogRegistry()
+    _pre_reg.load()
+    _no_data_packs = []
+    for _pid, _ in valid_packs:
+        _, _pinfo = _gwi(_pre_reg, _pid, ambient_temp)
+        if _pinfo["status"] == "none":
+            _no_data_packs.append(_pid)
+        elif _pinfo["status"] == "extrapolated":
+            st.warning(
+                f"PRECISE — **{_pid}**: {_pinfo['description']}"
+            )
+        elif _pinfo["status"] == "single":
+            delta = abs(_pinfo["entries_used"][0]["temperature_c"] - ambient_temp)
+            if delta > 5.0:
+                st.info(f"PRECISE — **{_pid}**: {_pinfo['description']}")
+    if _no_data_packs:
+        st.warning(
+            f"**PRECISE mode**: no registered ECM log data for "
+            f"{', '.join('`' + p + '`' for p in _no_data_packs)}. "
+            "These packs will use STANDARD default parameters instead. "
+            "Go to **Tools > Log Analysis > Parameter Fitter** to register a log."
+        )
+
 # ── Run simulation ────────────────────────────────────────────────────────────
+def _get_sim_mode(mode_name: str):
+    from batteries.voltage_model import ModelMode
+    return {"FAST": ModelMode.FAST, "STANDARD": ModelMode.STANDARD,
+            "PRECISE": ModelMode.PRECISE}.get(mode_name, ModelMode.FAST)
+
+def _load_sim_ecm(mode_name: str, pack_id: str):
+    if mode_name != "PRECISE":
+        return None
+    try:
+        from batteries.ecm_store import LogRegistry, get_ecm_with_info
+        _reg = LogRegistry()
+        _reg.load()
+        ecm, info = get_ecm_with_info(_reg, pack_id, ambient_temp)
+        if "ecm_source_info" not in st.session_state:
+            st.session_state["ecm_source_info"] = {}
+        st.session_state["ecm_source_info"][pack_id] = info
+        return ecm
+    except Exception:
+        return None
+
 def run_all_simulations():
     from mission.simulator import run_simulation
     results = {}
@@ -100,6 +153,9 @@ def run_all_simulations():
                 peukert_k=peukert_k,
                 cutoff_soc_pct=cutoff_soc,
                 dod_limit_pct=dod_limit,
+                mode=_get_sim_mode(model_mode_name),
+                ecm_params=_load_sim_ecm(model_mode_name, pid),
+                equipment_db=db.equipment,
             )
             results[pid] = r
         except Exception as e:
@@ -116,6 +172,7 @@ with col_clear:
         st.rerun()
 
 if run_btn:
+    st.session_state["ecm_source_info"] = {}   # clear stale info before new run
     st.session_state["sim_results"] = run_all_simulations()
     st.rerun()
 
@@ -146,6 +203,51 @@ st.dataframe(
     use_container_width=True, hide_index=True
 )
 
+# ── PRECISE mode ECM source info ───────────────────────────────────────────────
+_ecm_info = st.session_state.get("ecm_source_info", {})
+if _ecm_info and any(r.model_mode == "PRECISE" for r in result_list):
+    _STATUS_STYLE = {
+        "interpolated": ("Interpolated",  "#E2EFDA"),
+        "extrapolated": ("Extrapolated",  "#FFF2CC"),
+        "single":       ("Single entry",  "#DDEEFF"),
+        "none":         ("No data (STANDARD used)", "#FFCCCC"),
+    }
+    with st.expander("PRECISE Mode — ECM Parameter Sources", expanded=True):
+        st.caption(
+            f"Ambient temperature used for ECM lookup: **{ambient_temp} °C**"
+        )
+        _rows = []
+        for _pid, _info in _ecm_info.items():
+            _label, _bg = _STATUS_STYLE.get(_info["status"], ("Unknown", "#FFFFFF"))
+            _eu = _info.get("entries_used", [])
+            _logs = " + ".join(
+                f"{e['log_filename']} ({e['temperature_c']:.1f}°C, {e['fitted_at']})"
+                for e in _eu
+            ) if _eu else "—"
+            _rows.append({
+                "Pack":        _pid,
+                "Method":      _label,
+                "Log(s) used": _logs,
+                "Details":     _info["description"],
+            })
+        _info_df = pd.DataFrame(_rows)
+        # Colour each row by resolution method
+        _bg_map = {
+            "Interpolated":            "#E2EFDA",
+            "Extrapolated":            "#FFF2CC",
+            "Single entry":            "#DDEEFF",
+            "No data (STANDARD used)": "#FFCCCC",
+        }
+
+        def _ecm_row_style(row):
+            bg = _bg_map.get(row["Method"], "#FFFFFF")
+            return [f"background-color: {bg}"] * len(row)
+
+        st.dataframe(
+            _info_df.style.apply(_ecm_row_style, axis=1),
+            use_container_width=True, hide_index=True,
+        )
+
 st.divider()
 
 # ── Time-series charts ────────────────────────────────────────────────────────
@@ -169,15 +271,15 @@ with tab_sag:
         t = np.array(r_sag.time_s)
         ax_sag.fill_between(t, 0,
                             np.array(r_sag.dv_ohmic),
-                            alpha=0.7, label="Ohmic (I·R)", color="#2196F3")
+                            alpha=0.7, label="Ohmic (I·R0)", color="#2196F3")
         ax_sag.fill_between(t,
                             np.array(r_sag.dv_ohmic),
                             np.array(r_sag.dv_ohmic) + np.array(r_sag.dv_ct),
-                            alpha=0.7, label="Charge-transfer", color="#FF9800")
+                            alpha=0.7, label="RC1 / Charge-transfer", color="#FF9800")
         ax_sag.fill_between(t,
                             np.array(r_sag.dv_ohmic) + np.array(r_sag.dv_ct),
                             np.array(r_sag.dv_ohmic) + np.array(r_sag.dv_ct) + np.array(r_sag.dv_conc),
-                            alpha=0.7, label="Concentration", color="#F44336")
+                            alpha=0.7, label="RC2 / Concentration", color="#F44336")
         ax_sag.set_xlabel("Time (s)")
         ax_sag.set_ylabel("Voltage Sag (V)")
         ax_sag.set_title(f"{sel_sag_id} — Voltage Sag Breakdown")

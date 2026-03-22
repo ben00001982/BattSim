@@ -152,56 +152,75 @@ class Equipment:
     model: str
     nom_voltage_v: float
     nom_current_a: float
-    idle_power_w: float
-    hover_power_w: float
-    climb_power_w: float
-    cruise_power_w: float
-    max_power_w: float
+    idle_power_w: float       # minimum draw when powered on but not working
+    operating_power_w: float  # normal working draw
+    max_power_w: float        # peak draw (e.g. servo slewing, camera capturing)
     weight_g: float
     efficiency_pct: float
     duty_cycle_pct: float
     notes: str = ""
     active: bool = True
 
-    def power_for_phase(self, phase_type: str) -> float:
-        """Return nominal power draw for a given flight phase.
-
-        Standard phases:
-            IDLE, TAKEOFF, CLIMB, CRUISE, HOVER, DESCEND, LAND,
-            PAYLOAD_OPS, EMERGENCY
-
-        Fixed-wing VTOL phases:
-            VTOL_TRANSITION  — lift+thrust overlap during transition (~80% max)
-            VTOL_HOVER       — dedicated multirotor hover (same as HOVER)
-            FW_CRUISE        — fixed-wing efficient cruise (lower than rotor cruise)
-            FW_CLIMB         — fixed-wing powered climb
-            FW_DESCEND       — fixed-wing glide descent (minimal power)
+    def resolve_power(self, state: str,
+                      custom_w: float | None = None,
+                      custom_pct: float | None = None) -> float:
         """
-        phase_map = {
-            # ── Standard multirotor phases ────────────────────────────────────
-            "IDLE":            self.idle_power_w,
-            "TAKEOFF":         self.max_power_w,
-            "CLIMB":           self.climb_power_w,
-            "CRUISE":          self.cruise_power_w,
-            "HOVER":           self.hover_power_w,
-            "DESCEND":         self.cruise_power_w * 0.70,
-            "LAND":            self.hover_power_w * 0.85,
-            "PAYLOAD_OPS":     self.hover_power_w,
-            "EMERGENCY":       self.max_power_w,
-            # ── Fixed-wing VTOL phases ────────────────────────────────────────
-            "VTOL_TRANSITION": self.max_power_w * 0.80,   # lift+forward thrust overlap
-            "VTOL_HOVER":      self.hover_power_w,         # explicit hover label
-            "FW_CRUISE":       self.cruise_power_w * 0.45, # efficient fixed-wing cruise
-            "FW_CLIMB":        self.climb_power_w * 0.70,  # fixed-wing climb
-            "FW_DESCEND":      self.idle_power_w,          # glide/near-idle descent
-        }
-        return phase_map.get(phase_type.upper(), self.cruise_power_w)
+        Return watts for a given assignment state.
+          "off"    -> 0.0
+          "idle"   -> self.idle_power_w
+          "on"     -> self.operating_power_w
+          "custom" -> custom_w  if custom_w is not None
+                      self.max_power_w * custom_pct / 100.0  if custom_pct is not None
+                      0.0 as fallback
+        Raises ValueError for unknown state strings.
+        """
+        s = state.lower()
+        if s == "off":
+            return 0.0
+        if s == "idle":
+            return self.idle_power_w
+        if s == "on":
+            return self.operating_power_w
+        if s == "custom":
+            if custom_w is not None:
+                return float(custom_w)
+            if custom_pct is not None:
+                return self.max_power_w * float(custom_pct) / 100.0
+            return 0.0
+        raise ValueError(f"Unknown equipment state: '{state}'. "
+                         f"Valid states: 'off', 'idle', 'on', 'custom'.")
 
     def __str__(self) -> str:
         return (f"{self.equip_id} [{self.category}]: "
                 f"{self.manufacturer} {self.model} | "
-                f"Hover:{self.hover_power_w}W Cruise:{self.cruise_power_w}W | "
+                f"Idle:{self.idle_power_w}W On:{self.operating_power_w}W "
+                f"Max:{self.max_power_w}W | "
                 f"{self.weight_g}g")
+
+
+@dataclass
+class EquipmentPhaseAssignment:
+    """
+    Records what state a single piece of equipment is in during one mission phase.
+    One row per (mission_id, phase_seq, equipment_id) triplet.
+    """
+    mission_id:   str
+    phase_seq:    int
+    equipment_id: str   # matches Equipment.equip_id
+
+    state: str   # "off" | "idle" | "on" | "custom"
+                 # "on" means operating_power_w
+                 # "custom" uses one of the two custom fields below
+
+    custom_power_w:   float | None = None   # direct watts (only when state="custom")
+    custom_power_pct: float | None = None   # % of max_power_w (only when state="custom")
+                                            # custom_power_w takes priority if both set
+
+    def effective_power(self, equipment: Equipment) -> float:
+        """Convenience wrapper — calls equipment.resolve_power() with this assignment."""
+        return equipment.resolve_power(
+            self.state, self.custom_power_w, self.custom_power_pct
+        )
 
 
 @dataclass
@@ -217,10 +236,12 @@ class UAVConfiguration:
     def total_weight_g(self) -> float:
         return sum(eq.weight_g * qty for eq, qty in self.equipment_list)
 
-    def phase_power_w(self, phase_type: str,
+    def phase_power_w(self, phase_type: str = "",
                       overrides: Optional[dict[str, float]] = None) -> float:
         """
-        Total power draw for a given phase type.
+        Total power draw at operating level (all equipment ON).
+        phase_type argument is accepted for backward compatibility but ignored —
+        per-phase distinction is now handled via EquipmentPhaseAssignment.
         overrides: {equip_id: power_w} — override per-item if needed.
         """
         total = 0.0
@@ -228,14 +249,14 @@ class UAVConfiguration:
             if overrides and eq.equip_id in overrides:
                 pw = overrides[eq.equip_id]
             else:
-                pw = eq.power_for_phase(phase_type)
+                pw = eq.operating_power_w
             total += pw * qty
         return total
 
-    def power_breakdown(self, phase_type: str) -> dict[str, float]:
-        """Return per-equipment power contribution for a phase."""
+    def power_breakdown(self, phase_type: str = "") -> dict[str, float]:
+        """Return per-equipment power contribution (at operating level)."""
         return {
-            eq.equip_id: eq.power_for_phase(phase_type) * qty
+            eq.equip_id: eq.operating_power_w * qty
             for eq, qty in self.equipment_list
         }
 
@@ -262,11 +283,11 @@ class MissionPhase:
     notes: str = ""
 
     def effective_power_w(self, uav: Optional[UAVConfiguration] = None) -> float:
-        """Return power: override if set, else compute from UAV config."""
+        """Return power: override if set, else compute from UAV config (all ON)."""
         if self.power_override_w is not None:
             return self.power_override_w
         if uav is not None:
-            return uav.phase_power_w(self.phase_type)
+            return uav.phase_power_w()
         return 0.0
 
     def energy_wh(self, uav: Optional[UAVConfiguration] = None) -> float:
@@ -280,6 +301,7 @@ class MissionProfile:
     mission_name: str
     uav_config_id: str
     phases: list[MissionPhase] = field(default_factory=list)
+    equipment_assignments: list[EquipmentPhaseAssignment] = field(default_factory=list)
 
     @property
     def total_duration_s(self) -> float:
@@ -291,6 +313,9 @@ class MissionProfile:
 
     def total_energy_wh(self, uav: Optional[UAVConfiguration] = None) -> float:
         return sum(p.energy_wh(uav) for p in self.phases)
+
+    def assignments_for_phase(self, phase_seq: int) -> list[EquipmentPhaseAssignment]:
+        return [a for a in self.equipment_assignments if a.phase_seq == phase_seq]
 
     def power_profile_w(self, uav: Optional[UAVConfiguration] = None,
                         resolution_s: float = 1.0) -> tuple[list[float], list[float]]:

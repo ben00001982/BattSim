@@ -17,8 +17,12 @@ REPORTS_DIR.mkdir(exist_ok=True)
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# ── Phase colours (hex) ───────────────────────────────────────────────────────
-PHASE_COLORS: dict[str, str] = {
+from batteries.ardupilot_modes import (
+    ALL_MODES, POWER_CATEGORIES, mode_name_to_category,
+)
+
+# ── Phase colours (hex) — keyed by power category ────────────────────────────
+_CATEGORY_COLORS: dict[str, str] = {
     "IDLE":            "#EEEEEE",
     "TAKEOFF":         "#FFD9B3",
     "CLIMB":           "#FFF0B3",
@@ -34,6 +38,20 @@ PHASE_COLORS: dict[str, str] = {
     "FW_CLIMB":        "#FFF5B3",
     "FW_DESCEND":      "#E0F5FF",
 }
+
+# Extend with ArduPilot mode names — each mapped to its category colour
+# so phase_color("LOITER") and phase_color("HOVER") both return "#C0D9F5"
+PHASE_COLORS: dict[str, str] = {**_CATEGORY_COLORS}
+for _m in ALL_MODES.values():
+    PHASE_COLORS[_m.name] = _CATEGORY_COLORS.get(_m.power_category, "#DDDDDD")
+
+# ── Phase types — power categories + all ArduPilot mode names ─────────────────
+PHASE_TYPES: list[str] = POWER_CATEGORIES + sorted(
+    n for n in ALL_MODES.keys() if n not in set(POWER_CATEGORIES)
+)
+
+# ── Mode descriptions (for tooltips in the Mission Builder) ──────────────────
+PHASE_DESCRIPTIONS: dict[str, str] = {m.name: m.description for m in ALL_MODES.values()}
 
 # ── Chemistry colours ─────────────────────────────────────────────────────────
 CHEM_COLORS: dict[str, str] = {

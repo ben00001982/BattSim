@@ -1,6 +1,6 @@
 """
 ui/pages/6_Tools.py
-Tools: Pack Builder, Log Analysis, and Bulk Data Upload.
+Tools: Pack Builder, Model Validation, and Bulk Data Upload.
 """
 import sys
 from pathlib import Path
@@ -12,21 +12,22 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-import tempfile
 import io
 
 st.set_page_config(page_title="Tools", page_icon="🔧", layout="wide")
 
 from ui.components.db_helpers import load_db, cells_to_df, packs_to_df, reload_db, load_config
-from ui.config import ACCENT, PHASE_COLORS
+from ui.config import ACCENT
 
 st.title("🔧 Tools")
-st.caption("Pack Builder, Log Analysis, and Bulk Data Upload.")
+st.caption("Pack Builder, Model Validation, and Bulk Data Upload.")
 
 db  = load_db()
 cfg = load_config()
 
-tab_builder, tab_log, tab_bulk = st.tabs(["Pack Builder", "Log Analysis", "Bulk Data Upload"])
+tab_builder, tab_validate, tab_bulk = st.tabs(
+    ["Pack Builder", "Model Validation", "Bulk Data Upload"]
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — PACK BUILDER
@@ -220,285 +221,121 @@ with tab_builder:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — LOG ANALYSIS
+# TAB 2 — MODEL VALIDATION
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_log:
-    st.subheader("📊 Log Analysis")
-    st.caption("Upload ArduPilot flight logs and compare against simulation predictions.")
+with tab_validate:
+    st.subheader("🔬 Model Validation")
+    st.caption("Compare FAST / STANDARD / PRECISE voltage model accuracy against a flight log.")
 
-    uploaded = st.file_uploader(
-        "Select flight log file",
-        type=["bin", "log", "txt", "csv"],
-        help="Supported formats: ArduPilot .bin (requires pymavlink), .log (DataFlash), .csv (Mission Planner export)",
-        key="log_uploader",
-    )
-
-    vehicle_type = st.radio("Vehicle type", ["copter", "plane"], horizontal=True, key="log_vehicle")
-    nom_cap_ah = st.number_input(
-        "Battery nominal capacity (Ah) — for SoC calculation (0 to skip)",
-        min_value=0.0, max_value=500.0, value=0.0, step=0.1, key="log_capacity"
-    )
-
-    # ── Generate synthetic test log ───────────────────────────────────────────
-    with st.expander("🧪 Generate Synthetic Test Log", expanded=False):
-        st.caption("Create a simulated flight log from a battery pack and mission. "
-                   "Useful for testing the analysis workflow without real flight data.")
-        pack_ids_cfg  = sorted(db.packs.keys())
-        mission_ids_t = sorted(db.missions.keys())
-        uav_ids_t     = sorted(db.uav_configs.keys())
-
-        if not (pack_ids_cfg and mission_ids_t and uav_ids_t):
-            st.warning("Need at least one pack, mission, and UAV config in the database.")
-        else:
-            st.caption("Match these parameters to those used on the Simulation page for a close comparison.")
-
-            col_t1, col_t2, col_t3 = st.columns(3)
-            with col_t1:
-                tl_pack_id    = st.selectbox("Battery pack", pack_ids_cfg, key="tl_pack")
-                tl_mission_id = st.selectbox("Mission", mission_ids_t, key="tl_mission")
-                tl_uav_id     = st.selectbox("UAV config", uav_ids_t, key="tl_uav")
-            with col_t2:
-                tl_ambient    = st.number_input("Ambient temp (°C)", -20, 55, 25, key="tl_temp")
-                tl_initial_soc = st.slider("Initial SoC (%)", 80, 100, 100, key="tl_soc")
-                tl_peukert    = st.slider("Peukert k", 1.00, 1.15, 1.05, 0.01, key="tl_peukert")
-            with col_t3:
-                tl_noise_v    = st.slider("Voltage noise (V)", 0.0, 0.5, 0.02, 0.01, key="tl_noise_v")
-                tl_noise_i    = st.slider("Current noise (A)", 0.0, 5.0, 0.5, 0.1, key="tl_noise_i")
-                tl_cutoff_soc = st.slider("Cutoff SoC (%)", 0, 20, 10, key="tl_cutoff")
-
-            if st.button("⚡ Generate Test Log", type="primary", key="tl_generate"):
-                try:
-                    from batteries.log_importer import generate_synthetic_log
-                    tl_pack    = db.packs[tl_pack_id]
-                    tl_mission = db.missions[tl_mission_id]
-                    tl_uav     = db.uav_configs[tl_uav_id]
-                    with st.spinner("Generating synthetic log…"):
-                        synth_log = generate_synthetic_log(
-                            pack=tl_pack, mission=tl_mission, uav=tl_uav,
-                            discharge_pts=db.discharge_pts,
-                            ambient_temp_c=tl_ambient,
-                            noise_v=tl_noise_v, noise_i=tl_noise_i,
-                            initial_soc_pct=float(tl_initial_soc),
-                            peukert_k=tl_peukert,
-                            cutoff_soc_pct=float(tl_cutoff_soc),
-                        )
-                    st.session_state["flight_log"] = synth_log
-                    st.success(f"Synthetic log generated: {synth_log.total_flight_s:.0f} s, "
-                               f"{len(synth_log.time_s)} samples. "
-                               f"Scroll down to view the analysis.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to generate log: {e}")
-
-    st.divider()
-
-    log_ready = False
-
-    if uploaded is None:
-        if st.session_state.get("flight_log") is not None:
-            log = st.session_state["flight_log"]
-            src = Path(log.source_file).name if log.source_file else "synthetic"
-            st.success(f"Using previously loaded log: `{src}`")
-            log_ready = True
-        else:
-            st.info("Upload a flight log file above, or generate a synthetic test log.")
+    log_val = st.session_state.get("flight_log")
+    if log_val is None:
+        st.info("Load a flight log in the **Log Tools** page first (upload or generate synthetic).")
     else:
-        suffix = Path(uploaded.name).suffix.lower()
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(uploaded.read())
-            tmp_path = Path(tmp.name)
-        try:
-            from batteries.log_importer import load_log
-            with st.spinner(f"Parsing {uploaded.name}…"):
-                log = load_log(
-                    path=tmp_path,
-                    nominal_capacity_ah=nom_cap_ah if nom_cap_ah > 0 else None,
-                    vehicle_type=vehicle_type,
-                )
-            st.session_state["flight_log"] = log
-            st.success(f"Loaded {uploaded.name}: {log.total_flight_s:.0f} s, {len(log.time_s)} samples")
-            log_ready = True
-        except ImportError as e:
-            st.error(f"Import error: {e}\nFor .bin files, install pymavlink: `pip install pymavlink`")
-        except Exception as e:
-            st.error(f"Failed to parse log: {e}")
+        st.success(f"Using log: `{Path(log_val.source_file).name}`  "
+                   f"({log_val.total_flight_s:.0f} s, {len(log_val.time_s)} samples)")
 
-    if log_ready:
-        log = st.session_state["flight_log"]
+        pack_ids_v = sorted(db.packs.keys())
+        mission_ids_v = sorted(db.missions.keys())
+        uav_ids_v = sorted(db.uav_configs.keys())
 
-        st.divider()
-        st.subheader("Flight Summary")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Duration",     f"{log.total_flight_s:.0f} s ({log.total_flight_s/60:.1f} min)")
-        c2.metric("Samples",      len(log.time_s))
-        c3.metric("Peak current", f"{log.peak_current_a:.1f} A")
-        c4.metric("Total mAh",    f"{log.total_mah:.0f} mAh")
-        c5.metric("Max cell temp",f"{log.max_temp_c:.1f} °C" if log.max_temp_c > -50 else "N/A")
-
-        c6, c7, c8 = st.columns(3)
-        c6.metric("Voltage range", f"{log.min_voltage_v:.2f} – {log.initial_voltage:.2f} V")
-        c7.metric("Total energy",  f"{log.total_energy_wh:.2f} Wh")
-        c8.metric("Source file",   Path(log.source_file).name)
-
-        st.divider()
-        st.subheader("Flight Data Charts")
-
-        t_log = np.array(log.time_s)
-
-        tab_volt, tab_curr, tab_soc, tab_temp, tab_phase = st.tabs([
-            "Voltage", "Current", "SoC", "Temperature", "Phase Timeline"
-        ])
-
-        with tab_volt:
-            fig, ax = plt.subplots(figsize=(11, 4))
-            if log.voltage_v:
-                ax.plot(t_log, log.voltage_v, color="#2196F3", linewidth=1.5, label="Terminal V")
-            if any(v > 0 for v in log.voltage_rest_v):
-                ax.plot(t_log, log.voltage_rest_v, color="#4CAF50", linewidth=1.2, linestyle="--",
-                        label="Resting V", alpha=0.8)
-            ax.set_xlabel("Time (s)"); ax.set_ylabel("Voltage (V)")
-            ax.set_title("Battery Voltage"); ax.legend(fontsize=9); ax.grid(alpha=0.3)
-            fig.tight_layout()
-            st.pyplot(fig, use_container_width=True)
-            plt.close(fig)
-
-        with tab_curr:
-            fig, ax = plt.subplots(figsize=(11, 4))
-            if log.current_a:
-                ax.plot(t_log, log.current_a, color="#FF9800", linewidth=1.2)
-                avg_i = log.avg_current_a
-                ax.axhline(avg_i, color="red", linewidth=1, linestyle="--", alpha=0.6,
-                           label=f"Avg: {avg_i:.1f} A")
-            ax.set_xlabel("Time (s)"); ax.set_ylabel("Current (A)")
-            ax.set_title("Discharge Current"); ax.legend(fontsize=9); ax.grid(alpha=0.3)
-            fig.tight_layout()
-            st.pyplot(fig, use_container_width=True)
-            plt.close(fig)
-
-        with tab_soc:
-            if log.soc_pct and any(s > 0 for s in log.soc_pct):
-                fig, ax = plt.subplots(figsize=(11, 4))
-                ax.plot(t_log, log.soc_pct, color=ACCENT, linewidth=1.5)
-                ax.set_xlabel("Time (s)"); ax.set_ylabel("SoC (%)")
-                ax.set_title("State of Charge"); ax.set_ylim(0, 105); ax.grid(alpha=0.3)
-                fig.tight_layout()
-                st.pyplot(fig, use_container_width=True)
-                plt.close(fig)
-            else:
-                st.info("SoC data not available. Provide nominal capacity (Ah) above to compute SoC.")
-
-        with tab_temp:
-            valid_temp = [t for t in log.temp_c if t > -50]
-            if valid_temp:
-                fig, ax = plt.subplots(figsize=(11, 4))
-                display_temp = [t if t > -50 else None for t in log.temp_c]
-                ax.plot(t_log, display_temp, color="#F44336", linewidth=1.5)
-                ax.set_xlabel("Time (s)"); ax.set_ylabel("Temperature (°C)")
-                ax.set_title("Battery Temperature"); ax.grid(alpha=0.3)
-                fig.tight_layout()
-                st.pyplot(fig, use_container_width=True)
-                plt.close(fig)
-            else:
-                st.info("No temperature data found in this log.")
-
-        with tab_phase:
-            if log.phase_type:
-                fig, ax = plt.subplots(figsize=(11, 2))
-                prev_ph = log.phase_type[0]
-                t_start = t_log[0]
-                for i, ph in enumerate(log.phase_type):
-                    if ph != prev_ph or i == len(log.phase_type) - 1:
-                        t_end = t_log[i]
-                        ax.barh(0, t_end - t_start, left=t_start, height=1,
-                                color=PHASE_COLORS.get(prev_ph, "#CCCCCC"),
-                                edgecolor="white", linewidth=0.3)
-                        ax.text((t_start + t_end) / 2, 0, prev_ph,
-                                ha="center", va="center", fontsize=6)
-                        t_start = t_log[i]
-                        prev_ph = ph
-                ax.set_xlim(t_log[0], t_log[-1])
-                ax.set_yticks([])
-                ax.set_xlabel("Time (s)")
-                ax.set_title("Flight Phase Timeline")
-                fig.tight_layout()
-                st.pyplot(fig, use_container_width=True)
-                plt.close(fig)
-
-                modes_seen = sorted(set(zip(log.flight_mode, log.phase_type)))
-                mode_df = pd.DataFrame([{"Flight Mode": m, "Phase Type": p} for m, p in modes_seen])
-                st.dataframe(mode_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No phase data available.")
-
-        st.divider()
-        st.subheader("Simulation Comparison")
-
-        sim_results = st.session_state.get("sim_results", {})
-        if not sim_results:
-            st.info("No simulation results available. Run a simulation on the **Simulation** page first.")
+        if not (pack_ids_v and mission_ids_v and uav_ids_v):
+            st.warning("Need at least one pack, mission, and UAV config to run validation.")
         else:
-            sel_sim_pack = st.selectbox("Compare with simulation for pack",
-                                        sorted(sim_results.keys()), key="log_sim_pack")
-            r_sim = sim_results[sel_sim_pack]
+            col_v1, col_v2, col_v3 = st.columns(3)
+            with col_v1:
+                val_pack_id    = st.selectbox("Battery pack", pack_ids_v, key="val_pack")
+                val_mission_id = st.selectbox("Mission", mission_ids_v, key="val_mission")
+                val_uav_id     = st.selectbox("UAV config", uav_ids_v, key="val_uav")
+            with col_v2:
+                val_ambient    = st.number_input("Ambient temp (°C)", -20, 55, 25, key="val_temp")
+                val_initial_soc= st.slider("Initial SoC (%)", 80, 100, 100, key="val_soc")
+                val_peukert    = st.slider("Peukert k", 1.00, 1.15, 1.05, 0.01, key="val_peukert")
+            with col_v3:
+                val_cutoff_soc = st.slider("Cutoff SoC (%)", 0, 20, 10, key="val_cutoff")
+                val_modes = st.multiselect(
+                    "Modes to compare",
+                    ["FAST", "STANDARD", "PRECISE"],
+                    default=["FAST", "STANDARD"],
+                    key="val_modes",
+                )
 
-            fig_cmp, axes_cmp = plt.subplots(2, 2, figsize=(13, 8))
-            fig_cmp.suptitle(f"Log vs Simulation — {sel_sim_pack}", fontsize=12, fontweight="bold")
-            t_sim = np.array(r_sim.time_s)
+            # Check if PRECISE ECM params available
+            from batteries.ecm_store import LogRegistry, get_ecm_for_temperature
+            _val_registry = LogRegistry()
+            _val_registry.load()
+            fitted_packs = list(set(e.pack_id for e in _val_registry.all_entries()))
+            if "PRECISE" in val_modes and val_pack_id not in fitted_packs:
+                st.warning(
+                    f"No fitted ECM params for `{val_pack_id}`. "
+                    "Use the **Log Tools** page to fit and register a log first, "
+                    "or deselect PRECISE mode."
+                )
 
-            axes_cmp[0, 0].plot(t_sim, r_sim.voltage_v, "b-", linewidth=2, label="Simulation", alpha=0.9)
-            if log.voltage_v:
-                axes_cmp[0, 0].plot(t_log, log.voltage_v, "r--", linewidth=1.5, label="Real log", alpha=0.8)
-            axes_cmp[0, 0].set_title("Terminal Voltage"); axes_cmp[0, 0].set_ylabel("V (V)")
-            axes_cmp[0, 0].legend(fontsize=8); axes_cmp[0, 0].grid(alpha=0.3)
+            if st.button("▶ Run Validation", type="primary", key="val_run"):
+                from batteries.voltage_model import ModelMode
+                from batteries.model_validator import validate_against_log, plot_validation
 
-            axes_cmp[0, 1].plot(t_sim, r_sim.current_a, "b-", linewidth=2, label="Simulation", alpha=0.9)
-            if log.current_a:
-                axes_cmp[0, 1].plot(t_log, log.current_a, "r--", linewidth=1.5, label="Real log", alpha=0.8)
-            axes_cmp[0, 1].set_title("Discharge Current"); axes_cmp[0, 1].set_ylabel("I (A)")
-            axes_cmp[0, 1].legend(fontsize=8); axes_cmp[0, 1].grid(alpha=0.3)
+                val_pack    = db.packs[val_pack_id]
+                val_mission = db.missions[val_mission_id]
+                val_uav     = db.uav_configs[val_uav_id]
 
-            if log.soc_pct and any(s > 0 for s in log.soc_pct):
-                axes_cmp[1, 0].plot(t_sim, r_sim.soc_pct, "b-", linewidth=2, label="Simulation")
-                axes_cmp[1, 0].plot(t_log, log.soc_pct, "r--", linewidth=1.5, label="Real log")
-                axes_cmp[1, 0].set_title("State of Charge"); axes_cmp[1, 0].set_ylabel("SoC (%)")
-                axes_cmp[1, 0].legend(fontsize=8); axes_cmp[1, 0].grid(alpha=0.3)
-            else:
-                axes_cmp[1, 0].text(0.5, 0.5, "SoC not available\nin log",
-                                    ha="center", va="center",
-                                    transform=axes_cmp[1, 0].transAxes, fontsize=10)
+                mode_map = {
+                    "FAST":     ModelMode.FAST,
+                    "STANDARD": ModelMode.STANDARD,
+                    "PRECISE":  ModelMode.PRECISE,
+                }
+                val_results = {}
+                progress_v = st.progress(0)
+                for idx, mode_name in enumerate(val_modes):
+                    progress_v.progress(idx / len(val_modes),
+                                        text=f"Validating {mode_name}...")
+                    ecm_p = get_ecm_for_temperature(_val_registry, val_pack_id, val_ambient) if mode_name == "PRECISE" else None
+                    try:
+                        val_results[mode_name] = validate_against_log(
+                            pack=val_pack, log=log_val,
+                            mission=val_mission, uav=val_uav,
+                            discharge_pts=db.discharge_pts,
+                            mode=mode_map[mode_name],
+                            ecm_params=ecm_p,
+                            ambient_temp_c=val_ambient,
+                            initial_soc_pct=float(val_initial_soc),
+                            peukert_k=val_peukert,
+                            cutoff_soc_pct=float(val_cutoff_soc),
+                        )
+                    except Exception as ve:
+                        st.error(f"{mode_name} failed: {ve}")
+                progress_v.progress(1.0, text="Done!")
+                st.session_state["val_results"] = val_results
 
-            if log.voltage_v and len(t_log) > 10:
-                v_log_interp = np.interp(t_sim, t_log, np.array(log.voltage_v),
-                                          left=log.voltage_v[0], right=log.voltage_v[-1])
-                residual = np.array(r_sim.voltage_v) - v_log_interp
-                rmse = float(np.sqrt(np.mean(residual ** 2)))
-                axes_cmp[1, 1].plot(t_sim, residual, color="purple", linewidth=1.5)
-                axes_cmp[1, 1].axhline(0, color="black", linewidth=0.8, linestyle="--")
-                axes_cmp[1, 1].fill_between(t_sim, residual, alpha=0.2, color="purple")
-                axes_cmp[1, 1].set_title(f"Voltage Residual  RMSE={rmse:.4f} V")
-                axes_cmp[1, 1].set_ylabel("ΔV (V)"); axes_cmp[1, 1].grid(alpha=0.3)
+            val_results = st.session_state.get("val_results", {})
+            if val_results:
+                # Metrics table
+                st.subheader("Accuracy Metrics")
+                metric_rows = []
+                for mname, vr in val_results.items():
+                    metric_rows.append({
+                        "Mode":    mname,
+                        "RMSE (V)": round(vr.rmse_v, 5),
+                        "MAE (V)":  round(vr.mae_v, 5),
+                        "R²":       round(vr.r_squared, 5),
+                        "Bias (V)": round(vr.bias_v, 5),
+                        "Points":   vr.n_points,
+                    })
+                st.dataframe(pd.DataFrame(metric_rows), use_container_width=True, hide_index=True)
 
-            for ax in axes_cmp.flat:
-                ax.set_xlabel("Time (s)")
-            fig_cmp.tight_layout()
-            st.pyplot(fig_cmp, use_container_width=True)
-            plt.close(fig_cmp)
-
-            if log.voltage_v and len(t_log) > 10:
-                v_log_interp = np.interp(t_sim, t_log, np.array(log.voltage_v),
-                                          left=log.voltage_v[0], right=log.voltage_v[-1])
-                residual = np.array(r_sim.voltage_v) - v_log_interp
-                rmse_v = float(np.sqrt(np.mean(residual ** 2)))
-                bias_v = float(np.mean(residual))
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Voltage RMSE", f"{rmse_v:.4f} V")
-                m2.metric("Voltage bias (sim − log)", f"{bias_v:+.4f} V")
-                m3.metric("Simulation duration",
-                          f"{r_sim.total_duration_s:.0f} s vs log {log.total_flight_s:.0f} s")
+                # Plot
+                st.subheader("Voltage Comparison")
+                from batteries.model_validator import plot_validation
+                fig_val = plot_validation(
+                    val_results,
+                    title=f"Model Validation — {val_pack_id}",
+                )
+                st.pyplot(fig_val, use_container_width=True)
+                plt.close(fig_val)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — BULK DATA UPLOAD
+# TAB 4 — BULK DATA UPLOAD
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_bulk:
     st.subheader("📤 Bulk Data Upload")
@@ -900,3 +737,4 @@ with bulk_sub_pdf:
             st.error(f"Failed to parse PDF: {e}")
     else:
         st.info("Upload a PDF datasheet to begin extraction.")
+

@@ -63,3 +63,6 @@ Desktop.ini
 # LibreOffice recalc scripts (generated at runtime)
 scripts/
 recalc.py
+
+# Live database file — changes on every UI edit, not source code
+battery_db.xlsx

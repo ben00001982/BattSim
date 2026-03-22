@@ -36,44 +36,10 @@ except ImportError:
     HAS_PYMAVLINK = False
 
 
-# ── ArduPilot flight mode → mission phase type map ───────────────────────────
-# Covers ArduCopter + ArduPlane common modes
-ARDUPILOT_MODE_MAP: dict[str, str] = {
-    # ArduCopter
-    "STABILIZE": "CRUISE", "ACRO": "CRUISE", "ALT_HOLD": "HOVER",
-    "AUTO": "CRUISE",      "GUIDED": "CRUISE","LOITER": "HOVER",
-    "RTL": "CRUISE",       "CIRCLE": "HOVER", "LAND": "LAND",
-    "OF_LOITER": "HOVER",  "DRIFT": "CRUISE", "SPORT": "CRUISE",
-    "AUTOTUNE": "HOVER",   "POSHOLD": "HOVER","BRAKE": "HOVER",
-    "THROW": "TAKEOFF",    "AVOID_ADSB": "CRUISE","GUIDED_NOGPS": "HOVER",
-    "SMART_RTL": "CRUISE", "FLOWHOLD": "HOVER",  "FOLLOW": "CRUISE",
-    "ZIGZAG": "CRUISE",    "SYSTEMID": "HOVER",  "AUTOROTATE": "DESCEND",
-    # ArduPlane
-    "MANUAL": "CRUISE",    "CIRCLE_PLANE": "HOVER","CRUISE_PLANE": "CRUISE",
-    "FLY_BY_WIRE_A": "CRUISE","FLY_BY_WIRE_B":"CRUISE","TRAINING": "CRUISE",
-    "TAKEOFF_PLANE": "TAKEOFF","QHOVER": "HOVER","QLOITER": "HOVER",
-    "QLAND": "LAND",       "QRTL": "CRUISE",  "QAUTOTUNE": "HOVER",
-    "QACRO": "CRUISE",
-    # Generic fallback
-    "UNKNOWN": "CRUISE",
-}
-
-ARDUPILOT_COPTER_MODES = {
-    0: "STABILIZE", 1: "ACRO",    2: "ALT_HOLD", 3: "AUTO",
-    4: "GUIDED",    5: "LOITER",  6: "RTL",       7: "CIRCLE",
-    9: "LAND",     11: "DRIFT",  13: "SPORT",    14: "AUTOTUNE",
-    15: "POSHOLD", 16: "BRAKE",  17: "THROW",    18: "AVOID_ADSB",
-    19: "GUIDED_NOGPS", 20: "SMART_RTL", 21: "FLOWHOLD",
-    22: "FOLLOW",  23: "ZIGZAG", 24: "SYSTEMID", 25: "AUTOROTATE",
-}
-
-ARDUPILOT_PLANE_MODES = {
-    0: "MANUAL",  1: "CIRCLE_PLANE",  2: "STABILIZE",  3: "TRAINING",
-    4: "ACRO",    5: "FLY_BY_WIRE_A", 6: "FLY_BY_WIRE_B", 10: "AUTO",
-    11: "RTL",   12: "LOITER",        15: "GUIDED",     17: "TAKEOFF_PLANE",
-    19: "QSTABILIZE",20:"QHOVER",     21:"QLOITER",     22:"QLAND",
-    23: "QRTL",  25: "QAUTOTUNE",     26: "QACRO",
-}
+# ── ArduPilot mode definitions (single source of truth) ──────────────────────
+from batteries.ardupilot_modes import (   # noqa: E402 — after stdlib imports
+    copter_num_to_name, mode_name_to_category,
+)
 
 
 # ── Core data container ───────────────────────────────────────────────────────
@@ -296,7 +262,7 @@ class TextLogParser:
                 if i_moden and i_moden < len(row):
                     mode_str = row[i_moden].strip().upper()
                 else:
-                    mode_str = ARDUPILOT_COPTER_MODES.get(mode_num, "UNKNOWN")
+                    mode_str = copter_num_to_name(mode_num)
                 self._mode_events.append((t_s, mode_str))
             except (ValueError, IndexError):
                 continue
@@ -337,17 +303,15 @@ class TextLogParser:
                 continue
 
     def _infer_phases(self, log: FlightLog):
-        """Map mode events to phase types and assign to each BAT sample."""
+        """Assign mode name as phase_type for each BAT sample."""
         mode_map = getattr(self, "_mode_events", [])
         for t in log.time_s:
-            phase = "CRUISE"
-            mode  = "AUTO"
+            mode = "AUTO"
             for t_ev, m_str in reversed(mode_map):
                 if t_ev <= t:
-                    mode  = m_str
-                    phase = ARDUPILOT_MODE_MAP.get(m_str, "CRUISE")
+                    mode = m_str
                     break
-            log.phase_type.append(phase)
+            log.phase_type.append(mode)   # mode name IS the phase type
             log.flight_mode.append(mode)
 
 
@@ -400,7 +364,7 @@ class BinaryLogParser:
                     t_s = (t_us - t0) / 1_000_000.0
                     mode_num = d.get("Mode", 0)
                     mode_str = d.get("ModeStr",
-                                     ARDUPILOT_COPTER_MODES.get(mode_num, "AUTO"))
+                                     copter_num_to_name(mode_num))
                     mode_rows.append((t_s, mode_str.upper()))
 
         if not log.time_s:
@@ -409,13 +373,12 @@ class BinaryLogParser:
         TextLogParser._fill_modes(self, log, [])
         self._mode_events_bin = mode_rows
         for t in log.time_s:
-            phase, mode = "CRUISE", "AUTO"
+            mode = "AUTO"
             for t_ev, m_str in reversed(mode_rows):
                 if t_ev <= t:
-                    phase = ARDUPILOT_MODE_MAP.get(m_str, "CRUISE")
-                    mode  = m_str
+                    mode = m_str
                     break
-            log.phase_type.append(phase)
+            log.phase_type.append(mode)   # mode name IS the phase type
             log.flight_mode.append(mode)
 
         log.compute_stats()

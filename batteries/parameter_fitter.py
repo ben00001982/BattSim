@@ -79,6 +79,10 @@ class FittedBatteryParams:
     temperature_range: tuple[float, float] = (0.0, 0.0)
     fit_warnings:     list[str] = field(default_factory=list)
 
+    # ── 2RC ECM (Phase 2) ──
+    ecm_params:      Optional["ECMParameters"] = None
+    ecm_diagnostics: dict = field(default_factory=dict)
+
     def summary(self) -> str:
         lines = ["══ Fitted Battery Parameters ══"]
         if self.r_internal_mohm:
@@ -303,7 +307,11 @@ def fit_internal_resistance(
 
     # ── Method 2: Detrended window regression ─────────────────────────────────
     if method in ("auto", "detrended_window"):
-        r_dw, w_dw = _detrended_window_estimates(v, i, t, valid, window_s=5.0)
+        # Adaptive window: target ~15 samples per window
+        _dt_arr = np.diff(t[valid]) if valid.sum() > 1 else np.array([1.0])
+        _dt_med = float(np.median(_dt_arr)) if len(_dt_arr) > 0 else 1.0
+        _window_s = max(5.0, min(60.0, 15.0 * _dt_med))
+        r_dw, w_dw = _detrended_window_estimates(v, i, t, valid, window_s=_window_s)
         if len(r_dw) >= 3:
             r_med = _weighted_median(r_dw, w_dw)
             r_med = _normalise_to_25c(r_med)
@@ -755,6 +763,27 @@ def fit_all(
         )
     print(f"        {cap_fit}")
 
+    # ── Stage 6: 2RC ECM parameters ──────────────────────────────────────────
+    print("  [6/6] Fitting 2RC ECM parameters...")
+    try:
+        from batteries.voltage_model import ECMParameters
+        # Build a minimal pack proxy for build_ecm_parameters_from_log
+        class _PackProxy:
+            internal_resistance_mohm = r_val
+        ecm, fit_summary, _diag = build_ecm_parameters_from_log(log, _PackProxy(), chem_id)
+        params.ecm_params = ecm
+        params.ecm_diagnostics = fit_summary
+        print(f"        R0={fit_summary.get('R0_mohm', 0):.2f} mO  "
+              f"R1={fit_summary.get('R1_mohm', 0):.2f} mO  "
+              f"R2={fit_summary.get('R2_mohm', 0):.2f} mO")
+        print(f"        t1={fit_summary.get('tau1_s', 0):.1f} s  "
+              f"t2={fit_summary.get('tau2_s', 0):.1f} s")
+    except Exception as _ecm_err:
+        params.fit_warnings.append(f"ECM fitting failed: {_ecm_err}")
+        print(f"        ECM fit failed: {_ecm_err}")
+
+    print("Phase 2 complete.")
+
     # ── Warnings ─────────────────────────────────────────────────────────────
     if r_fit.r_squared < 0.5 and r_fit.value > 0:
         params.fit_warnings.append(
@@ -795,4 +824,247 @@ def apply_fitted_params(
         # Scale energy proportionally
         if old_cap > 0:
             p.pack_energy_wh *= fitted.actual_capacity_ah.value / old_cap
+    # ECM params are attached but not mutated (they reference the pack-level R)
+    if hasattr(fitted, "ecm_params") and fitted.ecm_params is not None:
+        p._ecm_params = fitted.ecm_params
     return p
+
+
+# ── ECM fitting helpers ────────────────────────────────────────────────────────
+
+def fit_R0_from_steps(
+    log: "FlightLog",
+    min_di_a: float = 5.0,
+    max_dt_s: float = 0.5,
+    r_bounds: tuple[float, float] = (0.5, 600.0),
+) -> FitResult:
+    """
+    Estimate R0 (pure ohmic resistance) from instantaneous current steps.
+
+    At dt < 0.5 s, only the ohmic branch responds (RC branches haven't
+    charged yet), so ΔV/ΔI ≈ R0.  With 1 Hz logs this gives combined
+    R0+RC1 at the first sample, which is the best achievable estimate.
+
+    Returns R0 in mΩ.
+    """
+    v = _to_arr(log.voltage_v)
+    i = _to_arr(log.current_a)
+    t = _to_arr(log.time_s)
+
+    r_vals = []
+    for k in range(len(t) - 1):
+        dt = float(t[k + 1] - t[k])
+        if dt > max_dt_s or dt <= 0:
+            continue
+        di = float(i[k + 1] - i[k])
+        dv = float(v[k + 1] - v[k])
+        if abs(di) < min_di_a:
+            continue
+        if di * dv >= 0:     # current rise must cause voltage drop
+            continue
+        r_est = -dv / di * 1000.0
+        if r_bounds[0] < r_est < r_bounds[1]:
+            r_vals.append(r_est)
+
+    if len(r_vals) < 3:
+        return FitResult(
+            "R0_mohm", 0.0, notes=f"Insufficient step responses ({len(r_vals)} found)"
+        )
+
+    r_arr = np.array(r_vals)
+    r_med = float(np.median(r_arr))
+    r_std = float(np.std(r_arr))
+    return FitResult(
+        "R0_mohm", round(r_med, 3), round(r_std, 3),
+        r_squared=0.0, n_samples=len(r_vals),
+        method="delta_vi_fast_steps",
+        notes=f"{len(r_vals)} current steps | ΔI_min={min_di_a}A | dt_max={max_dt_s}s",
+    )
+
+
+def fit_rc_time_constants(
+    log: "FlightLog",
+    r0_mohm: float,
+    min_di_drop_a: float = 5.0,
+    recovery_window_s: float = 60.0,
+    min_recovery_pts: int = 10,
+) -> tuple[FitResult, FitResult, FitResult, FitResult]:
+    """
+    Fit 2RC time constants from voltage recovery after current steps down.
+
+    After a large current drop (throttle-down), voltage recovers as:
+        V(t) = V_inf - A * exp(-t/τ1) - B * exp(-t/τ2)
+
+    Returns (τ1_result, τ2_result, R1_result, R2_result) — all in SI units
+    except R values which are in mΩ.  Returns zero-value FitResults if
+    insufficient recovery data is found.
+    """
+    if not HAS_SCIPY:
+        return (
+            FitResult("tau1_s",  0.0, notes="scipy required for RC fitting"),
+            FitResult("tau2_s",  0.0, notes="scipy required for RC fitting"),
+            FitResult("R1_mohm", 0.0, notes="scipy required for RC fitting"),
+            FitResult("R2_mohm", 0.0, notes="scipy required for RC fitting"),
+        )
+
+    v = _to_arr(log.voltage_v)
+    i = _to_arr(log.current_a)
+    t = _to_arr(log.time_s)
+
+    tau1_vals, tau2_vals, r1_vals, r2_vals = [], [], [], []
+
+    for k in range(len(t) - 1):
+        di = float(i[k] - i[k + 1])        # drop in current (positive = drop)
+        if di < min_di_drop_a:
+            continue
+        dt_step = float(t[k + 1] - t[k])
+        if dt_step > 5.0:
+            continue
+
+        # Collect recovery window
+        i_new = float(i[k + 1])
+        t0    = float(t[k + 1])
+        mask  = (t >= t0) & (t <= t0 + recovery_window_s)
+        if mask.sum() < min_recovery_pts:
+            continue
+        t_rec = t[mask] - t0
+        v_rec = v[mask]
+        i_rec = i[mask]
+
+        # Skip if current is not stable during recovery
+        if float(i_rec.max() - i_rec.min()) > min_di_drop_a * 0.5:
+            continue
+
+        # Model: V(t) = V_inf - A*exp(-t/τ1) - B*exp(-t/τ2)
+        v_inf_est = float(v_rec[-1]) + i_new * r0_mohm / 1000.0
+
+        def double_exp(t_arr, v_inf, A, tau1, B, tau2):
+            return v_inf - A * np.exp(-t_arr / tau1) - B * np.exp(-t_arr / tau2)
+
+        try:
+            p0 = [v_inf_est, 0.05, 10.0, 0.02, 100.0]
+            bounds = ([v_rec[0] - 0.5, 0, 0.5, 0, 10],
+                      [v_rec[0] + 2.0, 2.0, 50.0, 2.0, 600.0])
+            popt, _ = curve_fit(double_exp, t_rec, v_rec, p0=p0,
+                                bounds=bounds, maxfev=2000)
+            _, A_fit, tau1_fit, B_fit, tau2_fit = popt
+
+            # Ensure τ1 < τ2
+            if tau1_fit > tau2_fit:
+                tau1_fit, tau2_fit = tau2_fit, tau1_fit
+                A_fit, B_fit = B_fit, A_fit
+
+            if 0.5 < tau1_fit < 50 and 10 < tau2_fit < 600:
+                r1_est = A_fit / (i_new + 0.001) * 1000.0 if i_new > 0.1 else 0.0
+                r2_est = B_fit / (i_new + 0.001) * 1000.0 if i_new > 0.1 else 0.0
+                if 0.1 < r1_est < 600 and 0.1 < r2_est < 600:
+                    tau1_vals.append(tau1_fit)
+                    tau2_vals.append(tau2_fit)
+                    r1_vals.append(r1_est)
+                    r2_vals.append(r2_est)
+        except Exception:
+            continue
+
+    def _make_result(name, vals, unit=""):
+        if not vals:
+            return FitResult(name, 0.0, notes="No valid recovery segments found")
+        arr = np.array(vals)
+        return FitResult(
+            name, round(float(np.median(arr)), 4), round(float(np.std(arr)), 4),
+            n_samples=len(vals), method="double_exp_fit",
+            notes=f"{len(vals)} recovery segments fitted{unit}",
+        )
+
+    return (
+        _make_result("tau1_s",  tau1_vals, " | τ1 [s]"),
+        _make_result("tau2_s",  tau2_vals, " | τ2 [s]"),
+        _make_result("R1_mohm", r1_vals,   " | R1 [mΩ]"),
+        _make_result("R2_mohm", r2_vals,   " | R2 [mΩ]"),
+    )
+
+
+def build_ecm_parameters_from_log(
+    log: "FlightLog",
+    pack,
+    chem_id: str = "LION21",
+) -> "ECMParameters":
+    """
+    Fit ECMParameters from a flight log.
+
+    Procedure:
+      1. Fit R0 from current steps (or fall back to default if insufficient data)
+      2. Fit τ1, τ2, R1, R2 from recovery curves
+      3. Build a default ECMParameters table and scale R0/R1/R2 to fitted values
+         while retaining the Arrhenius temperature shape and SoC variation
+
+    Returns an ECMParameters object ready for ModelMode.PRECISE.
+    """
+    from batteries.voltage_model import default_ecm_params, ECMParameters, bilinear_interp
+
+    r_pack = pack.internal_resistance_mohm
+
+    # Step 1 — R0 from steps
+    r0_fit = fit_R0_from_steps(log)
+    r0_mohm = r0_fit.value if r0_fit.value > 1.0 else r_pack * 0.5
+
+    # Step 2 — RC time constants
+    tau1_r, tau2_r, r1_r, r2_r = fit_rc_time_constants(log, r0_mohm)
+    r1_mohm = r1_r.value if r1_r.value > 1.0 else r_pack * 0.5
+    r2_mohm = r2_r.value if r2_r.value > 0.1 else r1_mohm * 0.30
+    tau1 = tau1_r.value if tau1_r.value > 0.5 else 10.0
+    tau2 = tau2_r.value if tau2_r.value > 5.0 else 120.0
+
+    # Step 3 — Build ECM using chemistry shape, scaled to fitted values at 25°C
+    base = default_ecm_params(r_pack, chem_id)
+
+    # Scale factors at 25°C, SoC=50% (reference point)
+    r0_base = bilinear_interp(base.R0_table, base.soc_breakpoints, base.temp_breakpoints, 50, 25)
+    r1_base = bilinear_interp(base.R1_table, base.soc_breakpoints, base.temp_breakpoints, 50, 25)
+    r2_base = bilinear_interp(base.R2_table, base.soc_breakpoints, base.temp_breakpoints, 50, 25)
+
+    scale_r0 = r0_mohm / r0_base if r0_base > 0 else 1.0
+    scale_r1 = r1_mohm / r1_base if r1_base > 0 else 1.0
+    scale_r2 = r2_mohm / r2_base if r2_base > 0 else 1.0
+
+    new_R0 = [[v * scale_r0 for v in row] for row in base.R0_table]
+    new_R1 = [[v * scale_r1 for v in row] for row in base.R1_table]
+    new_R2 = [[v * scale_r2 for v in row] for row in base.R2_table]
+
+    # Recompute C tables from fitted time constants × scaled R
+    new_C1, new_C2 = [], []
+    for si, soc in enumerate(base.soc_breakpoints):
+        c1_row, c2_row = [], []
+        for ti in range(len(base.temp_breakpoints)):
+            r1_ohm = new_R1[si][ti] / 1000.0
+            r2_ohm = new_R2[si][ti] / 1000.0
+            c1_row.append(round(tau1 / r1_ohm if r1_ohm > 0 else 1.0, 3))
+            c2_row.append(round(tau2 / r2_ohm if r2_ohm > 0 else 1.0, 3))
+        new_C1.append(c1_row)
+        new_C2.append(c2_row)
+
+    ecm = ECMParameters(
+        soc_breakpoints=base.soc_breakpoints,
+        temp_breakpoints=base.temp_breakpoints,
+        R0_table=[[round(v, 4) for v in row] for row in new_R0],
+        R1_table=[[round(v, 4) for v in row] for row in new_R1],
+        C1_table=new_C1,
+        R2_table=[[round(v, 4) for v in row] for row in new_R2],
+        C2_table=new_C2,
+    )
+    fit_summary = {
+        "R0_mohm":    round(r0_mohm, 3),
+        "R1_mohm":    round(r1_mohm, 3),
+        "R2_mohm":    round(r2_mohm, 3),
+        "tau1_s":     round(tau1, 3),
+        "tau2_s":     round(tau2, 3),
+        "n_steps":    r0_fit.n_samples,
+        "n_recovery": tau1_r.n_samples,
+    }
+    diagnostics = {
+        "r0_fit":  str(r0_fit),
+        "tau1_fit": str(tau1_r),
+        "tau2_fit": str(tau2_r),
+        "r1_fit":  str(r1_r),
+        "r2_fit":  str(r2_r),
+    }
+    return ecm, fit_summary, diagnostics

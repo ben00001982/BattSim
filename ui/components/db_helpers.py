@@ -186,11 +186,24 @@ def plot_specific_energy_bar(packs, max_n: int = 30, title="Specific Energy (Wh/
 
 
 def plot_sim_timeseries(results: list, packs: list) -> plt.Figure:
-    """Multi-pack SoC, voltage, current, and temperature overlay charts."""
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+    """Multi-pack SoC, voltage, current, temperature, and equipment-power overlay charts."""
+    # Determine whether any result has assignment-based equipment power data
+    has_equip_power = any(
+        bool(r.equipment_power_w) and any(v > 0 for v in r.equipment_power_w)
+        for r in results
+    )
+
+    n_rows = 3 if has_equip_power else 2
+    fig, axes = plt.subplots(n_rows, 2, figsize=(13, 4 * n_rows))
     cmap = plt.get_cmap("tab10")
 
-    ax_soc, ax_v, ax_i, ax_t = axes[0, 0], axes[0, 1], axes[1, 0], axes[1, 1]
+    ax_soc = axes[0, 0]
+    ax_v   = axes[0, 1]
+    ax_i   = axes[1, 0]
+    ax_t   = axes[1, 1]
+    ax_pw  = axes[2, 0] if has_equip_power else None
+    if has_equip_power:
+        axes[2, 1].set_visible(False)  # unused cell in row 3
 
     for idx, (r, p) in enumerate(zip(results, packs)):
         col = cmap(idx % 10)
@@ -200,6 +213,9 @@ def plot_sim_timeseries(results: list, packs: list) -> plt.Figure:
         ax_v.plot(  t, r.voltage_v, color=col, linewidth=1.5, label=lbl)
         ax_i.plot(  t, r.current_a, color=col, linewidth=1.2, label=lbl, alpha=0.8)
         ax_t.plot(  t, r.temp_c,    color=col, linewidth=1.2, label=lbl, alpha=0.8)
+        if ax_pw is not None and r.equipment_power_w:
+            ax_pw.plot(t, r.equipment_power_w, color=col, linewidth=1.2,
+                       label=lbl, alpha=0.8)
 
     for ax, ylabel, title in [
         (ax_soc, "SoC (%)",     "State of Charge"),
@@ -214,16 +230,29 @@ def plot_sim_timeseries(results: list, packs: list) -> plt.Figure:
         if len(results) <= 8:
             ax.legend(fontsize=7, loc="best")
 
+    if ax_pw is not None:
+        ax_pw.set_xlabel("Time (s)")
+        ax_pw.set_ylabel("Power (W)")
+        ax_pw.set_title("Equipment Power (assignment-based)")
+        ax_pw.grid(alpha=0.3)
+        if len(results) <= 8:
+            ax_pw.legend(fontsize=7, loc="best")
+
     fig.tight_layout()
     return fig
 
 
-def plot_phase_power(mission, uav) -> plt.Figure:
-    """Bar chart of power per mission phase."""
+def plot_phase_power(mission, uav, phase_power_fn=None) -> plt.Figure:
+    """Bar chart of power per mission phase.
+
+    phase_power_fn: optional callable(phase) -> float; if provided it is used
+    instead of phase.effective_power_w(uav) so assignment-aware power values
+    can be shown.
+    """
     fig, ax = plt.subplots(figsize=(9, 4))
     phases = mission.phases
     names  = [f"{p.phase_seq}. {p.phase_name}" for p in phases]
-    powers = [p.effective_power_w(uav) for p in phases]
+    powers = [phase_power_fn(p) if phase_power_fn else p.effective_power_w(uav) for p in phases]
     colors = [phase_color(p.phase_type) for p in phases]
 
     bars = ax.bar(range(len(names)), powers, color=colors, edgecolor="#666", linewidth=0.5)

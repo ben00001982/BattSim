@@ -16,7 +16,8 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="Mission Configurator", page_icon="⚙️", layout="wide")
 
 from ui.components.db_helpers import load_db, load_config, save_config, plot_phase_power, reload_db
-from ui.config import PHASE_COLORS, DB_PATH
+from ui.config import PHASE_COLORS, DB_PATH, PHASE_TYPES, PHASE_DESCRIPTIONS
+from batteries.ardupilot_modes import modes_by_vehicle, POWER_CATEGORIES, ALL_MODES
 
 st.title("⚙️ Mission Configurator")
 st.caption("Configure your analysis setup, or build and edit mission profiles.")
@@ -24,12 +25,6 @@ st.caption("Configure your analysis setup, or build and edit mission profiles.")
 db = load_db()
 
 tab_config, tab_builder = st.tabs(["Mission & Battery Config", "Mission Builder"])
-
-PHASE_TYPES = [
-    "IDLE", "TAKEOFF", "CLIMB", "CRUISE", "HOVER",
-    "DESCEND", "LAND", "PAYLOAD_OPS", "EMERGENCY",
-    "VTOL_TRANSITION", "VTOL_HOVER", "FW_CRUISE", "FW_CLIMB", "FW_DESCEND",
-]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — MISSION & BATTERY CONFIG
@@ -174,12 +169,35 @@ with tab_config:
     if mission and uav:
         st.divider()
 
+        # ── Assignment-aware power helpers (reused by all charts below) ────────
+        _asgn_key_cfg = f"eq_asgn_{sel_mission_id}"
+        _session_asgn = st.session_state.get(_asgn_key_cfg, {})
+        _eq_items      = uav.equipment_list
+
+        def _resolve_state(phase_seq, equip_id):
+            sk = (phase_seq, equip_id)
+            if sk in _session_asgn:
+                return _session_asgn[sk][0], _session_asgn[sk][1]
+            for _a in mission.equipment_assignments:
+                if _a.phase_seq == phase_seq and _a.equipment_id == equip_id:
+                    return _a.state, _a.custom_power_w
+            return "on", None
+
+        def _phase_assigned_power(ph):
+            if ph.power_override_w is not None:
+                return ph.power_override_w
+            total = 0.0
+            for _eq, _qty in _eq_items:
+                _state, _cw = _resolve_state(ph.phase_seq, _eq.equip_id)
+                total += _eq.resolve_power(_state, _cw) * _qty
+            return total
+
         with st.expander("Mission Phase Breakdown", expanded=True):
             phase_rows = []
             cumulative_wh = 0.0
             for ph in mission.phases:
-                pw = ph.effective_power_w(uav)
-                wh = ph.energy_wh(uav)
+                pw = _phase_assigned_power(ph)
+                wh = pw * ph.duration_s / 3600
                 cumulative_wh += wh
                 phase_rows.append({
                     "#":             ph.phase_seq,
@@ -207,10 +225,12 @@ with tab_config:
 
             col_total1, col_total2, col_total3 = st.columns(3)
             col_total1.metric("Total duration", f"{mission.total_duration_s/60:.1f} min")
-            col_total2.metric("Total energy (UAV demand)", f"{mission.total_energy_wh(uav):.1f} Wh")
+            _total_asgn_wh = sum(_phase_assigned_power(ph) * ph.duration_s / 3600
+                                   for ph in mission.phases)
+            col_total2.metric("Total energy (UAV demand)", f"{_total_asgn_wh:.1f} Wh")
             col_total3.metric("Total distance", f"{mission.total_distance_m:.0f} m")
 
-            fig_pw = plot_phase_power(mission, uav)
+            fig_pw = plot_phase_power(mission, uav, phase_power_fn=_phase_assigned_power)
             st.pyplot(fig_pw, use_container_width=True)
             plt.close(fig_pw)
 
@@ -218,16 +238,139 @@ with tab_config:
             equip_rows = []
             for eq, qty in uav.equipment_list:
                 equip_rows.append({
-                    "ID":        eq.equip_id,
-                    "Category":  eq.category,
-                    "Qty":       qty,
-                    "Hover W":   eq.hover_power_w * qty,
-                    "Cruise W":  eq.cruise_power_w * qty,
-                    "Max W":     eq.max_power_w * qty,
-                    "Weight (g)":eq.weight_g * qty,
+                    "ID":            eq.equip_id,
+                    "Category":      eq.category,
+                    "Qty":           qty,
+                    "Idle W":        eq.idle_power_w      * qty,
+                    "Operating W":   eq.operating_power_w * qty,
+                    "Max W":         eq.max_power_w       * qty,
+                    "Weight (g)":    eq.weight_g          * qty,
                 })
             st.dataframe(pd.DataFrame(equip_rows), use_container_width=True, hide_index=True)
             st.metric("Total UAV weight (excl. battery)", f"{uav.total_weight_g():.0f} g")
+
+        # ── Mission Timeline + Power Profile charts ────────────────────────────
+        with st.expander("📊 Mission Timeline & Power Profile", expanded=True):
+            import matplotlib.patches as _mpatches
+            from matplotlib.gridspec import GridSpec as _GridSpec
+
+            _phases_sorted = sorted(mission.phases, key=lambda p: p.phase_seq)
+            # _eq_items, _resolve_state, _phase_assigned_power already defined above
+
+            # Build cumulative time axis
+            _t_start = 0.0
+            _phase_spans = []   # (t_start, duration, phase)
+            for _ph in _phases_sorted:
+                _phase_spans.append((_t_start, _ph.duration_s, _ph))
+                _t_start += _ph.duration_s
+            _total_dur = _t_start or 1.0
+
+            # State colours for equipment rows
+            _STATE_COLORS = {
+                "on":     "#4CAF50",
+                "idle":   "#FFC107",
+                "off":    "#BDBDBD",
+                "custom": "#2196F3",
+            }
+
+            _n_eq = len(_eq_items)
+            _row_h = 0.7   # height of each equipment row in data units
+
+            # Figure: top = timeline, bottom = power
+            _fig = plt.figure(figsize=(13, 5 + _n_eq * 0.55))
+            _gs  = _GridSpec(2, 1, figure=_fig,
+                             height_ratios=[1 + _n_eq * 0.55, 2.5],
+                             hspace=0.08)
+            _ax_tl = _fig.add_subplot(_gs[0])
+            _ax_pw = _fig.add_subplot(_gs[1], sharex=_ax_tl)
+
+            # ── Top: timeline ─────────────────────────────────────────────────
+            # Phase strip at the top row (y = n_eq … n_eq+1)
+            for _ts, _dur, _ph in _phase_spans:
+                _col = PHASE_COLORS.get(_ph.phase_type, "#EEEEEE")
+                _ax_tl.broken_barh(
+                    [(_ts, _dur)], (_n_eq, _row_h),
+                    facecolors=_col, edgecolors="#555", linewidth=0.6,
+                )
+                if _dur / _total_dur > 0.04:
+                    _ax_tl.text(
+                        _ts + _dur / 2, _n_eq + _row_h / 2,
+                        f"{_ph.phase_name}\n{int(_ph.duration_s)}s",
+                        ha="center", va="center", fontsize=6.5, fontweight="bold",
+                        clip_on=True,
+                    )
+
+            # Equipment rows (bottom of chart, y = 0 … n_eq)
+            # Reverse once into a list so the iterator isn't consumed twice
+            _eq_items_rev = list(reversed(_eq_items))
+            for _ei, (_eq, _qty) in enumerate(_eq_items_rev):
+                _y = _ei
+                for _ts, _dur, _ph in _phase_spans:
+                    _st, _ = _resolve_state(_ph.phase_seq, _eq.equip_id)
+                    _ecol  = _STATE_COLORS.get(_st, "#EEEEEE")
+                    _ax_tl.broken_barh(
+                        [(_ts, _dur)], (_y, _row_h * 0.85),
+                        facecolors=_ecol, edgecolors="#999", linewidth=0.3,
+                    )
+                    if _dur / _total_dur > 0.06:
+                        _ax_tl.text(
+                            _ts + _dur / 2, _y + _row_h * 0.425,
+                            _st, ha="center", va="center",
+                            fontsize=5.5, color="white" if _st in ("on", "off") else "black",
+                            clip_on=True,
+                        )
+
+            # Y-axis: label rows (use same reversed list)
+            _eq_labels = [f"{eq.equip_id[:18]} ×{qty}" for eq, qty in _eq_items_rev]
+            _eq_yticks = [i + _row_h * 0.425 for i in range(_n_eq)]
+            _ax_tl.set_yticks(_eq_yticks + [_n_eq + _row_h / 2])
+            _ax_tl.set_yticklabels(_eq_labels + ["Phases"], fontsize=6)
+            _ax_tl.set_ylim(-0.1, _n_eq + _row_h + 0.1)
+            _ax_tl.set_xlim(0, _total_dur)
+            _ax_tl.set_title(f"Mission Timeline — {mission.mission_name}", fontsize=10)
+            _ax_tl.grid(axis="x", alpha=0.25)
+            _ax_tl.tick_params(labelbottom=False)
+            _ax_tl.set_ylabel("")
+
+            # State colour legend
+            _state_patches = [
+                _mpatches.Patch(color=_c, label=_s.capitalize())
+                for _s, _c in _STATE_COLORS.items()
+            ]
+            _ax_tl.legend(
+                handles=_state_patches, loc="upper right",
+                fontsize=7, title="Equipment State", title_fontsize=7,
+                framealpha=0.8,
+            )
+
+            # ── Bottom: power profile ─────────────────────────────────────────
+            for _ts, _dur, _ph in _phase_spans:
+                _pw   = _phase_assigned_power(_ph)
+                _col  = PHASE_COLORS.get(_ph.phase_type, "#EEEEEE")
+                _ax_pw.fill_between(
+                    [_ts, _ts + _dur], 0, _pw,
+                    color=_col, alpha=0.75, step="post",
+                )
+                _ax_pw.hlines(_pw, _ts, _ts + _dur, colors="#333", linewidth=1.5)
+                if _dur / _total_dur > 0.04:
+                    _ax_pw.text(
+                        _ts + _dur / 2, _pw * 0.5 if _pw > 0 else 5,
+                        f"{_ph.phase_type}\n{_pw:.0f}W",
+                        ha="center", va="center", fontsize=6,
+                        clip_on=True,
+                    )
+                # Vertical dividers
+                _ax_pw.axvline(_ts, color="#888", linewidth=0.5, linestyle="--", alpha=0.5)
+
+            _ax_pw.set_xlim(0, _total_dur)
+            _ax_pw.set_ylim(bottom=0)
+            _ax_pw.set_xlabel("Time (s)", fontsize=9)
+            _ax_pw.set_ylabel("Power (W)", fontsize=9)
+            _ax_pw.set_title("Per-Phase Power (Equipment Assignments)", fontsize=10)
+            _ax_pw.grid(axis="y", alpha=0.3)
+
+            st.pyplot(_fig, use_container_width=True)
+            plt.close(_fig)
 
         st.divider()
         st.subheader("Save Configuration")
@@ -352,105 +495,119 @@ with tab_builder:
     if not can_add:
         st.info("Enter a Mission ID above to start adding phases.")
     else:
-        st.subheader("Add Phase")
-
-        col_p1, col_p2, col_p3 = st.columns(3)
-        with col_p1:
-            ph_seq      = st.number_input("Sequence #", 1, 999, next_seq, key="mb_ph_seq")
-            ph_name     = st.text_input("Phase Name*", key="mb_ph_name",
-                                        help="e.g. Initial Climb, Waypoint Cruise")
-            ph_type     = st.selectbox("Phase Type*", PHASE_TYPES, key="mb_ph_type")
-        with col_p2:
-            ph_duration = st.number_input("Duration (s)*", 0.0, 86400.0, 60.0, 1.0, key="mb_ph_dur")
-            ph_distance = st.number_input("Distance (m)", 0.0, 500000.0, 0.0, 10.0, key="mb_ph_dist")
-            ph_altitude = st.number_input("Altitude (m AGL)", 0.0, 5000.0, 0.0, 1.0, key="mb_ph_alt")
-        with col_p3:
-            ph_airspeed = st.number_input("Airspeed (m/s)", 0.0, 200.0, 0.0, 0.5, key="mb_ph_spd")
-            ph_override = st.number_input("Power override (W, 0 = auto)", 0.0, 100000.0, 0.0, 10.0,
-                                          key="mb_ph_ovr")
-            ph_notes    = st.text_input("Notes", key="mb_ph_notes")
-
-        # Live power/energy estimate
-        if working_uav_id in db.uav_configs:
-            est_w  = ph_override if ph_override > 0 else db.uav_configs[working_uav_id].phase_power_w(ph_type)
-            est_wh = est_w * ph_duration / 3600
-            st.caption(f"Estimated: **{est_w:.0f} W** | **{est_wh:.2f} Wh** for this phase")
-
-        col_add, col_save_new = st.columns([1, 2])
-
-        with col_add:
-            if st.button("➕ Add Phase", type="primary", key="mb_add_phase"):
-                if not ph_name:
-                    st.error("Phase Name is required.")
-                elif ph_duration <= 0:
-                    st.error("Duration must be > 0.")
+        with st.expander("➕ Add Phase", expanded=True):
+            col_p1, col_p2, col_p3 = st.columns(3)
+            with col_p1:
+                ph_seq      = st.number_input("Sequence #", 1, 999, next_seq, key="mb_ph_seq")
+                ph_name     = st.text_input("Phase Name*", key="mb_ph_name",
+                                            help="e.g. Initial Climb, Waypoint Cruise")
+                _veh_filter = st.radio(
+                    "Vehicle / mode group",
+                    ["Copter modes", "Plane modes", "Legacy categories"],
+                    horizontal=True, key="mb_veh_filter",
+                )
+                if _veh_filter == "Copter modes":
+                    _type_opts = [m.name for m in modes_by_vehicle("copter")]
+                elif _veh_filter == "Plane modes":
+                    _type_opts = [m.name for m in modes_by_vehicle("plane")]
                 else:
-                    phase_row = {
-                        "Seq": ph_seq, "Phase Name": ph_name, "Type": ph_type,
-                        "Duration (s)": ph_duration, "Distance (m)": ph_distance,
-                        "Altitude (m)": ph_altitude, "Airspeed m/s": ph_airspeed,
-                        "Override W": ph_override if ph_override > 0 else None,
-                        "Notes": ph_notes,
-                    }
+                    _type_opts = POWER_CATEGORIES
+                ph_type = st.selectbox("Phase Type*", _type_opts, key="mb_ph_type")
+                if ph_type in ALL_MODES:
+                    _desc = ALL_MODES[ph_type].description
+                    _cat  = ALL_MODES[ph_type].power_category
+                    st.caption(f"_{_cat}: {_desc}_")
+            with col_p2:
+                ph_duration = st.number_input("Duration (s)*", 0.0, 86400.0, 60.0, 1.0, key="mb_ph_dur")
+                ph_distance = st.number_input("Distance (m)", 0.0, 500000.0, 0.0, 10.0, key="mb_ph_dist")
+                ph_altitude = st.number_input("Altitude (m AGL)", 0.0, 5000.0, 0.0, 1.0, key="mb_ph_alt")
+            with col_p3:
+                ph_airspeed = st.number_input("Airspeed (m/s)", 0.0, 200.0, 0.0, 0.5, key="mb_ph_spd")
+                ph_override = st.number_input("Power override (W, 0 = auto)", 0.0, 100000.0, 0.0, 10.0,
+                                              key="mb_ph_ovr")
+                ph_notes    = st.text_input("Notes", key="mb_ph_notes")
 
-                    if mode == "Create new mission":
-                        staged_key = f"mb_staged_{working_mission_id}"
-                        if staged_key not in st.session_state:
-                            st.session_state[staged_key] = []
-                        st.session_state[staged_key].append(phase_row)
-                        st.success(f"Phase '{ph_name}' staged (seq {ph_seq}).")
-                        st.rerun()
+            # Live power/energy estimate
+            if working_uav_id in db.uav_configs:
+                est_w  = ph_override if ph_override > 0 else db.uav_configs[working_uav_id].phase_power_w()
+                est_wh = est_w * ph_duration / 3600
+                st.caption(f"Estimated: **{est_w:.0f} W** | **{est_wh:.2f} Wh** for this phase")
+
+            col_add, col_save_new = st.columns([1, 2])
+
+            with col_add:
+                if st.button("➕ Add Phase", type="primary", key="mb_add_phase"):
+                    if not ph_name:
+                        st.error("Phase Name is required.")
+                    elif ph_duration <= 0:
+                        st.error("Duration must be > 0.")
                     else:
-                        # Write directly to sheet
-                        try:
-                            from openpyxl import load_workbook
-                            wb = load_workbook(DB_PATH)
-                            ws = wb["Mission_Profiles"]
-                            ws.append([
-                                working_mission_id, working_mission_name,
-                                working_uav_id, ph_seq, ph_name, ph_type,
-                                ph_duration, ph_distance, ph_altitude,
-                                ph_airspeed,
-                                ph_override if ph_override > 0 else None,
-                                ph_notes,
-                            ])
-                            wb.save(DB_PATH)
-                            reload_db()
-                            st.success(f"Phase '{ph_name}' added to `{working_mission_id}`.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Failed to save phase: {e}")
+                        phase_row = {
+                            "Seq": ph_seq, "Phase Name": ph_name, "Type": ph_type,
+                            "Duration (s)": ph_duration, "Distance (m)": ph_distance,
+                            "Altitude (m)": ph_altitude, "Airspeed m/s": ph_airspeed,
+                            "Override W": ph_override if ph_override > 0 else None,
+                            "Notes": ph_notes,
+                        }
 
-        with col_save_new:
-            if mode == "Create new mission":
-                staged_key = f"mb_staged_{working_mission_id}"
-                staged = st.session_state.get(staged_key, [])
-                if staged:
-                    if st.button(f"💾 Save mission '{working_mission_id}' ({len(staged)} phases)",
-                                 type="primary", key="mb_save_mission"):
-                        if not working_mission_name:
-                            st.error("Mission Name is required before saving.")
+                        if mode == "Create new mission":
+                            staged_key = f"mb_staged_{working_mission_id}"
+                            if staged_key not in st.session_state:
+                                st.session_state[staged_key] = []
+                            st.session_state[staged_key].append(phase_row)
+                            st.success(f"Phase '{ph_name}' staged (seq {ph_seq}).")
+                            st.rerun()
                         else:
+                            # Write directly to sheet
                             try:
                                 from openpyxl import load_workbook
                                 wb = load_workbook(DB_PATH)
                                 ws = wb["Mission_Profiles"]
-                                for row in staged:
-                                    ws.append([
-                                        working_mission_id, working_mission_name,
-                                        working_uav_id,
-                                        row["Seq"], row["Phase Name"], row["Type"],
-                                        row["Duration (s)"], row["Distance (m)"],
-                                        row["Altitude (m)"], row["Airspeed m/s"],
-                                        row["Override W"], row["Notes"],
-                                    ])
+                                ws.append([
+                                    working_mission_id, working_mission_name,
+                                    working_uav_id, ph_seq, ph_name, ph_type,
+                                    ph_duration, ph_distance, ph_altitude,
+                                    ph_airspeed,
+                                    ph_override if ph_override > 0 else None,
+                                    ph_notes,
+                                ])
                                 wb.save(DB_PATH)
                                 reload_db()
-                                st.session_state[staged_key] = []
-                                st.success(f"Mission `{working_mission_id}` saved with {len(staged)} phases!")
+                                st.success(f"Phase '{ph_name}' added to `{working_mission_id}`.")
                                 st.rerun()
                             except Exception as e:
-                                st.error(f"Failed to save mission: {e}")
+                                st.error(f"Failed to save phase: {e}")
+
+            with col_save_new:
+                if mode == "Create new mission":
+                    staged_key = f"mb_staged_{working_mission_id}"
+                    staged = st.session_state.get(staged_key, [])
+                    if staged:
+                        if st.button(f"💾 Save mission '{working_mission_id}' ({len(staged)} phases)",
+                                     type="primary", key="mb_save_mission"):
+                            if not working_mission_name:
+                                st.error("Mission Name is required before saving.")
+                            else:
+                                try:
+                                    from openpyxl import load_workbook
+                                    wb = load_workbook(DB_PATH)
+                                    ws = wb["Mission_Profiles"]
+                                    for row in staged:
+                                        ws.append([
+                                            working_mission_id, working_mission_name,
+                                            working_uav_id,
+                                            row["Seq"], row["Phase Name"], row["Type"],
+                                            row["Duration (s)"], row["Distance (m)"],
+                                            row["Altitude (m)"], row["Airspeed m/s"],
+                                            row["Override W"], row["Notes"],
+                                        ])
+                                    wb.save(DB_PATH)
+                                    reload_db()
+                                    st.session_state[staged_key] = []
+                                    st.success(f"Mission `{working_mission_id}` saved with {len(staged)} phases!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed to save mission: {e}")
 
     # ── Edit existing phase ───────────────────────────────────────────────────
     if mode == "Edit existing mission" and edit_mission and edit_mission.phases:
@@ -471,6 +628,8 @@ with tab_builder:
                                       index=PHASE_TYPES.index(sel_ph.phase_type)
                                             if sel_ph.phase_type in PHASE_TYPES else 0,
                                       key="mb_e_type")
+                if e_type in ALL_MODES:
+                    st.caption(f"_{ALL_MODES[e_type].power_category}: {ALL_MODES[e_type].description}_")
             with col_e2:
                 e_dur  = st.number_input("Duration (s)",  0.0, 86400.0,  float(sel_ph.duration_s),  1.0, key="mb_e_dur")
                 e_dist = st.number_input("Distance (m)",  0.0, 500000.0, float(sel_ph.distance_m),  10.0, key="mb_e_dist")
@@ -544,6 +703,229 @@ with tab_builder:
                         st.error("Phase row not found in workbook.")
                 except Exception as e:
                     st.error(f"Failed to delete phase: {e}")
+
+    # ── Equipment Phase Assignments ───────────────────────────────────────────
+    if mode == "Edit existing mission" and edit_mission and edit_mission.phases:
+        st.divider()
+        with st.expander("⚡ Equipment Phase Assignments", expanded=False):
+            st.caption(
+                "Set the power state for each equipment item in each phase. "
+                "States: **off** (0 W), **idle** (idle_power_w), **on** (operating_power_w), "
+                "**custom** (enter watts or % of max)."
+            )
+
+            _uav_asgn = db.uav_configs.get(working_uav_id)
+            if not _uav_asgn or not _uav_asgn.equipment_list:
+                st.info("No equipment in the selected UAV configuration.")
+            else:
+                _phases_sorted = sorted(edit_mission.phases, key=lambda p: p.phase_seq)
+                _existing_asgn: dict[tuple[int, str], str] = {
+                    (a.phase_seq, a.equipment_id): a.state
+                    for a in edit_mission.equipment_assignments
+                }
+                _state_opts = ["on", "idle", "off", "custom"]
+                _asgn_key   = f"eq_asgn_{working_mission_id}"
+                if _asgn_key not in st.session_state:
+                    st.session_state[_asgn_key] = {}
+
+                # Phase selector — one phase at a time to avoid nested expanders
+                _phase_labels = [
+                    f"#{_ph.phase_seq} — {_ph.phase_name} ({_ph.phase_type})"
+                    for _ph in _phases_sorted
+                ]
+                _sel_ph_label = st.selectbox(
+                    "Phase to configure", _phase_labels, key="mb_asgn_phase_sel"
+                )
+                _sel_ph_idx = _phase_labels.index(_sel_ph_label)
+                _ph = _phases_sorted[_sel_ph_idx]
+
+                st.write(f"**Phase #{_ph.phase_seq} — {_ph.phase_name}**  |  "
+                         f"duration {_ph.duration_s:.0f} s")
+                st.divider()
+
+                for _eq, _qty in _uav_asgn.equipment_list:
+                    _key_state = f"asgn_{working_mission_id}_{_ph.phase_seq}_{_eq.equip_id}_state"
+                    _key_cw    = f"asgn_{working_mission_id}_{_ph.phase_seq}_{_eq.equip_id}_cw"
+                    _def_state = _existing_asgn.get((_ph.phase_seq, _eq.equip_id), "on")
+
+                    _c1, _c2, _c3 = st.columns([3, 2, 2])
+                    with _c1:
+                        st.write(f"**{_eq.equip_id}** ×{_qty} ({_eq.category})")
+                        st.caption(
+                            f"idle={_eq.idle_power_w:.0f}W  "
+                            f"op={_eq.operating_power_w:.0f}W  "
+                            f"max={_eq.max_power_w:.0f}W"
+                        )
+                    with _c2:
+                        _sel_state = st.selectbox(
+                            "State", _state_opts,
+                            index=_state_opts.index(_def_state) if _def_state in _state_opts else 0,
+                            key=_key_state,
+                        )
+                    with _c3:
+                        if _sel_state == "custom":
+                            _cw = st.number_input(
+                                "Custom W", 0.0, float(_eq.max_power_w) * 2,
+                                float(_eq.operating_power_w), 1.0, key=_key_cw,
+                            )
+                        else:
+                            _cw = None
+
+                    # Collect into session state
+                    _sk = (_ph.phase_seq, _eq.equip_id)
+                    st.session_state[_asgn_key][_sk] = (_sel_state, _cw)
+
+                # Save button
+                if st.button("💾 Save Equipment Assignments", type="primary", key="mb_save_asgn"):
+                    from batteries.models import EquipmentPhaseAssignment as _EPA
+                    _new_asgns = []
+                    for (_pseq, _eid), (_st, _cw) in st.session_state.get(_asgn_key, {}).items():
+                        _new_asgns.append(_EPA(
+                            mission_id=working_mission_id,
+                            phase_seq=_pseq,
+                            equipment_id=_eid,
+                            state=_st,
+                            custom_power_w=_cw if _st == "custom" else None,
+                        ))
+                    try:
+                        db.save_equipment_assignments(working_mission_id, _new_asgns)
+                        reload_db()
+                        st.success(f"Saved {len(_new_asgns)} equipment assignments for "
+                                   f"`{working_mission_id}`.")
+                        st.rerun()
+                    except Exception as _e:
+                        st.error(f"Failed to save assignments: {_e}")
+
+    # ── Mission Timeline & Power Profile (builder view) ───────────────────────
+    if mode == "Edit existing mission" and edit_mission and working_uav_id in db.uav_configs:
+        import matplotlib.patches as _mpatches_b
+        from matplotlib.gridspec import GridSpec as _GridSpec_b
+
+        _bld_uav    = db.uav_configs[working_uav_id]
+        _bld_phases = sorted(edit_mission.phases, key=lambda p: p.phase_seq)
+        _bld_eq     = _bld_uav.equipment_list
+        _bld_asgn_key = f"eq_asgn_{working_mission_id}"
+        _bld_session  = st.session_state.get(_bld_asgn_key, {})
+
+        def _bld_resolve(phase_seq, equip_id):
+            sk = (phase_seq, equip_id)
+            if sk in _bld_session:
+                return _bld_session[sk][0], _bld_session[sk][1]
+            for _a in edit_mission.equipment_assignments:
+                if _a.phase_seq == phase_seq and _a.equipment_id == equip_id:
+                    return _a.state, _a.custom_power_w
+            return "on", None
+
+        def _bld_power(ph):
+            if ph.power_override_w is not None:
+                return ph.power_override_w
+            _tot = 0.0
+            for _eq, _qty in _bld_eq:
+                _state, _cw = _bld_resolve(ph.phase_seq, _eq.equip_id)
+                _tot += _eq.resolve_power(_state, _cw) * _qty
+            return _tot
+
+        with st.expander("📊 Mission Timeline & Power Profile", expanded=True):
+            _bld_t = 0.0
+            _bld_spans = []
+            for _ph in _bld_phases:
+                _bld_spans.append((_bld_t, _ph.duration_s, _ph))
+                _bld_t += _ph.duration_s
+            _bld_total = _bld_t or 1.0
+
+            _STATE_COLORS_B = {
+                "on": "#4CAF50", "idle": "#FFC107",
+                "off": "#BDBDBD", "custom": "#2196F3",
+            }
+            _bld_n_eq = len(_bld_eq)
+            _bld_row_h = 0.7
+
+            _bld_fig = plt.figure(figsize=(13, 5 + _bld_n_eq * 0.55))
+            _bld_gs  = _GridSpec_b(2, 1, figure=_bld_fig,
+                                   height_ratios=[1 + _bld_n_eq * 0.55, 2.5],
+                                   hspace=0.08)
+            _bld_ax_tl = _bld_fig.add_subplot(_bld_gs[0])
+            _bld_ax_pw = _bld_fig.add_subplot(_bld_gs[1], sharex=_bld_ax_tl)
+
+            for _ts, _dur, _ph in _bld_spans:
+                _col = PHASE_COLORS.get(_ph.phase_type, "#EEEEEE")
+                _bld_ax_tl.broken_barh(
+                    [(_ts, _dur)], (_bld_n_eq, _bld_row_h),
+                    facecolors=_col, edgecolors="#555", linewidth=0.6,
+                )
+                if _dur / _bld_total > 0.04:
+                    _bld_ax_tl.text(
+                        _ts + _dur / 2, _bld_n_eq + _bld_row_h / 2,
+                        f"{_ph.phase_name}\n{int(_ph.duration_s)}s",
+                        ha="center", va="center", fontsize=6.5, fontweight="bold",
+                        clip_on=True,
+                    )
+
+            _bld_eq_rev = list(reversed(_bld_eq))
+            for _ei, (_eq, _qty) in enumerate(_bld_eq_rev):
+                _y = _ei
+                for _ts, _dur, _ph in _bld_spans:
+                    _stt, _ = _bld_resolve(_ph.phase_seq, _eq.equip_id)
+                    _ecol   = _STATE_COLORS_B.get(_stt, "#EEEEEE")
+                    _bld_ax_tl.broken_barh(
+                        [(_ts, _dur)], (_y, _bld_row_h * 0.85),
+                        facecolors=_ecol, edgecolors="#999", linewidth=0.3,
+                    )
+                    if _dur / _bld_total > 0.06:
+                        _bld_ax_tl.text(
+                            _ts + _dur / 2, _y + _bld_row_h * 0.425,
+                            _stt, ha="center", va="center", fontsize=5.5,
+                            color="white" if _stt in ("on", "off") else "black",
+                            clip_on=True,
+                        )
+
+            _bld_labels  = [f"{eq.equip_id[:18]} ×{qty}" for eq, qty in _bld_eq_rev]
+            _bld_yticks  = [i + _bld_row_h * 0.425 for i in range(_bld_n_eq)]
+            _bld_ax_tl.set_yticks(_bld_yticks + [_bld_n_eq + _bld_row_h / 2])
+            _bld_ax_tl.set_yticklabels(_bld_labels + ["Phases"], fontsize=6)
+            _bld_ax_tl.set_ylim(-0.1, _bld_n_eq + _bld_row_h + 0.1)
+            _bld_ax_tl.set_xlim(0, _bld_total)
+            _bld_ax_tl.set_title(
+                f"Mission Timeline — {edit_mission.mission_name}", fontsize=10
+            )
+            _bld_ax_tl.grid(axis="x", alpha=0.25)
+            _bld_ax_tl.tick_params(labelbottom=False)
+
+            _bld_patches = [
+                _mpatches_b.Patch(color=_c, label=_s.capitalize())
+                for _s, _c in _STATE_COLORS_B.items()
+            ]
+            _bld_ax_tl.legend(
+                handles=_bld_patches, loc="upper right",
+                fontsize=7, title="Equipment State", title_fontsize=7,
+                framealpha=0.8,
+            )
+
+            for _ts, _dur, _ph in _bld_spans:
+                _pw  = _bld_power(_ph)
+                _col = PHASE_COLORS.get(_ph.phase_type, "#EEEEEE")
+                _bld_ax_pw.fill_between(
+                    [_ts, _ts + _dur], 0, _pw,
+                    color=_col, alpha=0.75, step="post",
+                )
+                _bld_ax_pw.hlines(_pw, _ts, _ts + _dur, colors="#333", linewidth=1.5)
+                if _dur / _bld_total > 0.04:
+                    _bld_ax_pw.text(
+                        _ts + _dur / 2, _pw * 0.5 if _pw > 0 else 5,
+                        f"{_ph.phase_type}\n{_pw:.0f}W",
+                        ha="center", va="center", fontsize=6, clip_on=True,
+                    )
+                _bld_ax_pw.axvline(_ts, color="#888", linewidth=0.5, linestyle="--", alpha=0.5)
+
+            _bld_ax_pw.set_xlim(0, _bld_total)
+            _bld_ax_pw.set_ylim(bottom=0)
+            _bld_ax_pw.set_xlabel("Time (s)", fontsize=9)
+            _bld_ax_pw.set_ylabel("Power (W)", fontsize=9)
+            _bld_ax_pw.set_title("Per-Phase Power (Equipment Assignments)", fontsize=10)
+            _bld_ax_pw.grid(axis="y", alpha=0.3)
+
+            st.pyplot(_bld_fig, use_container_width=True)
+            plt.close(_bld_fig)
 
     # ── All missions summary ──────────────────────────────────────────────────
     st.divider()

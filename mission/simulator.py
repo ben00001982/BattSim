@@ -15,7 +15,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from batteries.models import BatteryPack, MissionProfile, UAVConfiguration
+from batteries.models import (
+    BatteryPack, MissionProfile, UAVConfiguration,
+    Equipment, EquipmentPhaseAssignment,
+)
 from batteries.discharge import (
     DischargeCurve, peukert_capacity,
     temperature_derate_factor, available_c_rates, closest_c_rate,
@@ -23,6 +26,7 @@ from batteries.discharge import (
 from batteries.voltage_model import (
     terminal_voltage, ThermalState,
     total_pack_resistance_mohm, CHEM_VOLTAGE_PARAMS,
+    ModelMode, ECMParameters, default_ecm_params,
 )
 
 
@@ -61,7 +65,17 @@ class SimulationResult:
     r_total:   list[float] = field(default_factory=list)        # mΩ
 
     # ── Phase labels ──
-    phase_type: list[str] = field(default_factory=list)
+    phase_type:      list[str]   = field(default_factory=list)
+
+    # ── Equipment power breakdown (assignment-based; empty list when N/A) ──
+    equipment_power_w: list[float] = field(default_factory=list)
+
+    # ── RC state time-series (STANDARD/PRECISE mode only) ──
+    v_rc1_ts:  list[float] = field(default_factory=list)
+    v_rc2_ts:  list[float] = field(default_factory=list)
+
+    # ── Model metadata ──
+    model_mode: str = "FAST"
 
     # ── Terminal flags ──
     depleted:      bool = False
@@ -123,6 +137,43 @@ class SimulationResult:
         return "\n".join(lines)
 
 
+# ── Equipment power helper ────────────────────────────────────────────────────
+
+def _total_equipment_power(
+    phase_seq:    int,
+    uav:          UAVConfiguration,
+    equipment_db: dict[str, Equipment],
+    assignments:  list[EquipmentPhaseAssignment],
+) -> float:
+    """
+    Sum resolved power across all UAV equipment for a given phase.
+
+    For each (equipment, qty) in uav.equipment_list:
+      - Look up the EquipmentPhaseAssignment for this equipment_id + phase_seq.
+      - If found, call equipment.resolve_power(state, custom_w, custom_pct).
+      - If not found, fall back to equipment.operating_power_w.
+      - Multiply resolved watts by qty.
+    """
+    # Build a fast lookup: equipment_id → assignment for this phase
+    phase_asgn: dict[str, EquipmentPhaseAssignment] = {
+        a.equipment_id: a
+        for a in assignments
+        if a.phase_seq == phase_seq
+    }
+
+    total = 0.0
+    for eq, qty in uav.equipment_list:
+        # Prefer the live Equipment object from equipment_db for up-to-date power values
+        live_eq = equipment_db.get(eq.equip_id, eq)
+        asgn = phase_asgn.get(eq.equip_id)
+        if asgn is not None:
+            pw = live_eq.resolve_power(asgn.state, asgn.custom_power_w, asgn.custom_power_pct)
+        else:
+            pw = live_eq.operating_power_w
+        total += pw * qty
+    return total
+
+
 # ── Main simulation function ──────────────────────────────────────────────────
 
 def run_simulation(
@@ -136,6 +187,9 @@ def run_simulation(
     peukert_k:       float = 1.05,
     cutoff_soc_pct:  float = 10.0,
     dod_limit_pct:   float = 80.0,
+    mode:            "ModelMode" = None,        # None → ModelMode.FAST
+    ecm_params:      Optional["ECMParameters"] = None,
+    equipment_db:    Optional[dict[str, Equipment]] = None,
 ) -> SimulationResult:
     """
     Run a full time-step discharge simulation.
@@ -208,11 +262,27 @@ def run_simulation(
     soc       = initial_soc_pct
     t         = 0.0
     cum_e_wh  = 0.0
+    from batteries.voltage_model import ModelMode as _MM
+    _mode = mode if mode is not None else _MM.FAST
+    v_rc1 = 0.0
+    v_rc2 = 0.0
+    result.model_mode = _mode.name
 
     # ── Time-step loop ─────────────────────────────────────────────────────────
     for phase in mission.phases:
-        phase_power_w = phase.effective_power_w(uav)
-        phase_steps   = int(round(phase.duration_s / dt_s))
+        # Resolve power for this phase
+        if equipment_db is not None:
+            equip_pw = _total_equipment_power(
+                phase.phase_seq, uav, equipment_db,
+                mission.equipment_assignments,
+            )
+            # Phase override takes precedence over equipment assignments
+            phase_power_w = phase.power_override_w if phase.power_override_w is not None else equip_pw
+        else:
+            phase_power_w = phase.effective_power_w(uav)
+            equip_pw      = 0.0
+
+        phase_steps = int(round(phase.duration_s / dt_s))
 
         for _ in range(phase_steps):
             # ── 1. Open-circuit voltage from curve (scaled to pack) ──
@@ -221,7 +291,7 @@ def run_simulation(
             v_ocv_pack  = v_ocv_cell * pack.cells_series
 
             # ── 2. Terminal voltage + current (fixed-point) ──
-            v_term, current, breakdown = terminal_voltage(
+            v_term, current, v_rc1, v_rc2, breakdown = terminal_voltage(
                 power_w=phase_power_w,
                 soc_pct=soc_clamped,
                 temp_c=thermal.temp_c,
@@ -231,6 +301,11 @@ def run_simulation(
                 capacity_ah=pack.pack_capacity_ah,
                 cells_series=pack.cells_series,
                 cells_parallel=pack.cells_parallel,
+                mode=_mode,
+                ecm_params=ecm_params,
+                v_rc1=v_rc1,
+                v_rc2=v_rc2,
+                dt_s=dt_s,
             )
 
             # ── 3. SoC update (Peukert + temperature derating) ──
@@ -264,6 +339,9 @@ def run_simulation(
             result.dv_conc.append(breakdown["dv_conc"])
             result.r_total.append(round(r_tot, 2))
             result.phase_type.append(phase.phase_type)
+            result.v_rc1_ts.append(round(v_rc1, 5))
+            result.v_rc2_ts.append(round(v_rc2, 5))
+            result.equipment_power_w.append(round(equip_pw, 1))
 
             t += dt_s
 
@@ -295,6 +373,7 @@ def compare_batteries(
     peukert_k:      float = 1.05,
     cutoff_soc_pct: float = 10.0,
     dt_s:           float = 1.0,
+    equipment_db:   Optional[dict[str, Equipment]] = None,
 ) -> list[SimulationResult]:
     """Run the same mission for multiple battery packs, return all results."""
     results = []
@@ -308,6 +387,7 @@ def compare_batteries(
             peukert_k=peukert_k,
             cutoff_soc_pct=cutoff_soc_pct,
             dt_s=dt_s,
+            equipment_db=equipment_db,
         )
         results.append(r)
     return results
@@ -324,6 +404,7 @@ def temperature_sweep(
     peukert_k:      float = 1.05,
     cutoff_soc_pct: float = 10.0,
     dt_s:           float = 1.0,
+    equipment_db:   Optional[dict[str, Equipment]] = None,
 ) -> list[SimulationResult]:
     """
     Run the same mission at multiple ambient temperatures.
@@ -339,6 +420,7 @@ def temperature_sweep(
             peukert_k=peukert_k,
             cutoff_soc_pct=cutoff_soc_pct,
             dt_s=dt_s,
+            equipment_db=equipment_db,
         )
         for t in temperatures_c
     ]

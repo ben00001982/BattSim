@@ -172,7 +172,7 @@ st.subheader("Quick Navigation")
 nav_cols = st.columns(6)
 pages = [
     ("1 Battery Browser",     "Browse and compare all battery packs in the database"),
-    ("2 Equipment Builder",   "Add equipment, build and edit UAV power profiles"),
+    ("2 UAV Configurator",    "Add equipment, build and edit UAV power profiles"),
     ("3 Mission Configurator","Select batteries, mission, and UAV — save analysis config"),
     ("4 Simulation",          "Run discharge simulations for all selected battery packs"),
     ("5 Reports",             "Generate Excel/PDF reports and temperature sweeps"),

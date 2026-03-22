@@ -1,7 +1,7 @@
 {
-  "mission_id": "SURVEY_STD",
-  "uav_id": "HEX_SURVEY_900",
-  "ambient_temp_c": 25.0,
+  "mission_id": "AG_SPRAY",
+  "uav_id": "HEX_AG_1200",
+  "ambient_temp_c": 20.0,
   "temp_sweep": [
     -10,
     -5,
@@ -17,12 +17,7 @@
     45
   ],
   "selected_batteries": [
-    "TATTU_TATTU_SEMI_SOLID_STATE_330WH_KG_25000MAH_10C",
-    "TATTU_TATTU_AGRI_16000MAH_45_6V_25C_12S1P_HIGH_VOL",
-    "TATTU_TATTU_PLUS_1_0_COMPACT_VERSION_10000MAH_44_4",
-    "TATTU_TATTU_PLUS_1_0_COMPACT_VERSION_16000MAH_44_4",
-    "TATTU_TA_PLUS1_0_15C_16000_12S1P_C_XT90",
-    "TATTU_TATTU_PRO_25C_16000MAH_12S1P_AS150_SMART_LIP"
+    "TATTU_TATTU_PRO_22000MAH_53_2V_25C_14S1P_HV_LIPO_S"
   ],
   "custom_equipment": {},
   "battery_combination": null,
