@@ -23,7 +23,7 @@ from ui.config import CHEM_COLORS
 
 st.title("🔍 Battery Browser")
 st.caption("Explore, filter, and compare all battery packs in the database.")
-st.caption("📖 New to BattSim? See **[User Guide → Battery Browser](8_User_Guide#battery-browser)** for a walkthrough.")
+st.page_link("pages/8_User_Guide.py", label="📖 User Guide — Battery Browser", icon=None)
 
 db = load_db()
 all_packs = list(db.packs.values())

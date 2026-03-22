@@ -23,7 +23,7 @@ from ui.config import PHASE_COLORS, CHEM_COLORS, ACCENT
 
 st.title("▶️ Simulation")
 st.caption("Run physics-based discharge simulations for all selected battery packs.")
-st.caption("📖 New to BattSim? See **[User Guide → Simulation](8_User_Guide#simulation)** for a walkthrough.")
+st.page_link("pages/8_User_Guide.py", label="📖 User Guide — Simulation", icon=None)
 
 db = load_db()
 cfg = load_config()

@@ -21,7 +21,7 @@ from ui.config import ACCENT, PHASE_COLORS, PHASE_TYPES as _ALL_PHASE_TYPES
 
 st.title("📋 Log Tools")
 st.caption("Log Analysis, Log Registry, ECM Parameter Viewer, and Log → Mission Extractor.")
-st.caption("📖 New to BattSim? See **[User Guide → Log Tools](8_User_Guide#log-tools)** and **[Log → Mission](8_User_Guide#log-mission)** for walkthroughs.")
+st.page_link("pages/8_User_Guide.py", label="📖 User Guide — Log Tools & Log → Mission", icon=None)
 
 db  = load_db()
 cfg = load_config()

@@ -47,7 +47,7 @@ except Exception as e:
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("🔋 BattSim — UAV Battery Analysis Tool")
 st.caption("Physics-based battery discharge simulation and selection tool for UAV missions.")
-st.caption("📖 First time here? Check the **[User Guide](8_User_Guide)** for a complete walkthrough of all features.")
+st.page_link("pages/8_User_Guide.py", label="📖 User Guide — complete walkthrough of all features", icon=None)
 
 if not db_ok:
     st.stop()

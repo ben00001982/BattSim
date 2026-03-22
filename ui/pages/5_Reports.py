@@ -23,7 +23,7 @@ from ui.config import REPORTS_DIR, ACCENT, PHASE_COLORS
 
 st.title("📄 Reports")
 st.caption("Temperature sensitivity sweep, battery scorecard, and report generation.")
-st.caption("📖 New to BattSim? See **[User Guide → Reports](8_User_Guide#reports)** for a walkthrough.")
+st.page_link("pages/8_User_Guide.py", label="📖 User Guide — Reports", icon=None)
 
 db  = load_db()
 cfg = load_config()

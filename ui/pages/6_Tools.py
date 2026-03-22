@@ -21,7 +21,7 @@ from ui.config import ACCENT
 
 st.title("🔧 Tools")
 st.caption("Pack Builder, Model Validation, and Bulk Data Upload.")
-st.caption("📖 New to BattSim? See **[User Guide → Tools](8_User_Guide#tools)** for a walkthrough.")
+st.page_link("pages/8_User_Guide.py", label="📖 User Guide — Tools", icon=None)
 
 db  = load_db()
 cfg = load_config()
