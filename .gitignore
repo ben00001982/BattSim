@@ -66,3 +66,6 @@ recalc.py
 
 # Live database file — changes on every UI edit, not source code
 battery_db.xlsx
+
+# MCP config — contains personal access tokens
+.mcp.json

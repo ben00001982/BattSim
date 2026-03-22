@@ -19,6 +19,7 @@ from ui.config import DB_PATH
 
 st.title("🛠️ UAV Configurator")
 st.caption("Add and edit equipment items, configure UAV power profiles, and manage UAV configurations.")
+st.caption("📖 New to BattSim? See **[User Guide → UAV Configurator](8_User_Guide#uav-configurator)** for a walkthrough.")
 
 db = load_db()
 

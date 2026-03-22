@@ -21,6 +21,7 @@ from batteries.ardupilot_modes import modes_by_vehicle, POWER_CATEGORIES, ALL_MO
 
 st.title("⚙️ Mission Configurator")
 st.caption("Configure your analysis setup, or build and edit mission profiles.")
+st.caption("📖 New to BattSim? See **[User Guide → Mission Configurator](8_User_Guide#mission-configurator)** for a walkthrough.")
 
 db = load_db()
 

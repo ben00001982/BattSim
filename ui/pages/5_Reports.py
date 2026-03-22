@@ -23,6 +23,7 @@ from ui.config import REPORTS_DIR, ACCENT, PHASE_COLORS
 
 st.title("📄 Reports")
 st.caption("Temperature sensitivity sweep, battery scorecard, and report generation.")
+st.caption("📖 New to BattSim? See **[User Guide → Reports](8_User_Guide#reports)** for a walkthrough.")
 
 db  = load_db()
 cfg = load_config()
@@ -87,6 +88,7 @@ def run_main_sims():
                 discharge_pts=db.discharge_pts,
                 ambient_temp_c=ambient_temp, dt_s=dt_s_rep,
                 peukert_k=peukert_k_rep, cutoff_soc_pct=cutoff_rep,
+                equipment_db=db.equipment,
             )
             results[pid] = r
         except Exception as e:
@@ -108,6 +110,7 @@ def run_temp_sweep():
                 discharge_pts=db.discharge_pts,
                 temperatures_c=temp_sweep, dt_s=sweep_dt_rep,
                 peukert_k=peukert_k_rep, cutoff_soc_pct=cutoff_rep,
+                equipment_db=db.equipment,
             )
             all_sweep[pid] = sw
             all_df[pid] = pd.DataFrame([{
@@ -358,6 +361,8 @@ else:
                         mission=mission,
                         uav_name=uav.name,
                         ambient_temp_c=ambient_temp,
+                        uav=uav,
+                        equipment_db=db.equipment,
                         sweep_df=sweep_df if sweep_df else None,
                         flight_log=st.session_state.get("flight_log"),
                     )

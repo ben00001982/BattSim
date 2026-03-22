@@ -21,6 +21,7 @@ from ui.config import ACCENT
 
 st.title("🔧 Tools")
 st.caption("Pack Builder, Model Validation, and Bulk Data Upload.")
+st.caption("📖 New to BattSim? See **[User Guide → Tools](8_User_Guide#tools)** for a walkthrough.")
 
 db  = load_db()
 cfg = load_config()
@@ -738,3 +739,5 @@ with bulk_sub_pdf:
     else:
         st.info("Upload a PDF datasheet to begin extraction.")
 
+
+# ══════════════════════════════════════════════════════════════════════════════

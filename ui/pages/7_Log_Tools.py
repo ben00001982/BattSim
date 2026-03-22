@@ -12,21 +12,22 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-import tempfile
+import tempfile, os
 
 st.set_page_config(page_title="Log Tools", page_icon="📋", layout="wide")
 
-from ui.components.db_helpers import load_db, load_config
-from ui.config import ACCENT, PHASE_COLORS
+from ui.components.db_helpers import load_db, load_config, reload_db
+from ui.config import ACCENT, PHASE_COLORS, PHASE_TYPES as _ALL_PHASE_TYPES
 
 st.title("📋 Log Tools")
-st.caption("Log Analysis, Log Registry, and ECM Parameter Viewer.")
+st.caption("Log Analysis, Log Registry, ECM Parameter Viewer, and Log → Mission Extractor.")
+st.caption("📖 New to BattSim? See **[User Guide → Log Tools](8_User_Guide#log-tools)** and **[Log → Mission](8_User_Guide#log-mission)** for walkthroughs.")
 
 db  = load_db()
 cfg = load_config()
 
-tab_log, tab_registry, tab_ecm_viewer = st.tabs(
-    ["Log Analysis", "Log Registry", "ECM Parameter Viewer"]
+tab_log, tab_registry, tab_ecm_viewer, tab_log_mission = st.tabs(
+    ["Log Analysis", "Log Registry", "ECM Parameter Viewer", "Log → Mission"]
 )
 
 
@@ -555,3 +556,467 @@ with tab_ecm_viewer:
                     "Fitted at":   e.fitted_at[:10],
                 })
             st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — LOG → MISSION
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_log_mission:
+    st.subheader("Log → Mission Extractor")
+    st.caption(
+        "Upload a flight log to extract mission phases from real flight data. "
+        "Choose whether to import power estimates alongside phase durations, "
+        "then edit and save the result as a new mission profile."
+    )
+
+    existing_log = st.session_state.get("flight_log")
+    use_existing = False
+
+    col_src, col_cfg_lm = st.columns([1, 1])
+    with col_src:
+        st.markdown("**Log source**")
+        if existing_log:
+            st.info(
+                f"Log in session: `{Path(existing_log.source_file).name}`  "
+                f"({existing_log.total_flight_s / 60:.1f} min, "
+                f"{len(existing_log.time_s)} samples)"
+            )
+            use_existing = st.checkbox(
+                "Use this log", value=True, key="lm_use_existing"
+            )
+        if not use_existing:
+            lm_upload = st.file_uploader(
+                "Upload flight log (.bin, .log, .csv)",
+                type=["bin", "log", "csv"],
+                key="lm_log_upload",
+            )
+            if lm_upload:
+                st.caption(f"{lm_upload.name}  ({lm_upload.size / 1024:.1f} KB)")
+
+    with col_cfg_lm:
+        st.markdown("**Extraction settings**")
+        lm_min_dur = st.slider(
+            "Minimum phase duration (s)",
+            2, 60, 8, key="lm_min_dur",
+            help="Phases shorter than this are flagged as transient.",
+        )
+
+    st.markdown("**Import mode**")
+    _lm_import_mode = st.radio(
+        "What to import from the log",
+        options=[
+            "Phase + duration only",
+            "Phase + duration + estimated power",
+        ],
+        index=1,
+        key="lm_import_mode",
+        horizontal=True,
+        help=(
+            "**Phase + duration only**: power_override_w is left blank on all phases. "
+            "The equipment model supplies power values at simulation time.\n\n"
+            "**Phase + duration + estimated power**: mean measured power (V × I) from "
+            "the log is stored as power_override_w on each phase. High and medium "
+            "confidence phases get the measured value; low confidence phases are left blank."
+        ),
+    )
+    _include_power = (_lm_import_mode == "Phase + duration + estimated power")
+
+    if _include_power:
+        st.caption(
+            "Measured power values will be stored on each phase as `power_override_w`. "
+            "Low-confidence phases will fall back to the equipment model."
+        )
+    else:
+        st.caption(
+            "No power values will be stored. Simulations will use the equipment "
+            "model to compute power for each phase."
+        )
+
+    if st.button("🔍 Extract phases", type="primary", key="lm_extract"):
+        if use_existing and existing_log:
+            _log = existing_log
+        elif not use_existing:
+            _up = st.session_state.get("lm_log_upload")
+            if not _up:
+                st.warning("Upload a log file above or generate a synthetic log in Log Analysis.")
+                st.stop()
+            _suffix = Path(_up.name).suffix.lower()
+            if _suffix == ".bin":
+                try:
+                    import pymavlink  # noqa
+                except ImportError:
+                    st.error("pymavlink required for .bin files: pip install pymavlink")
+                    st.stop()
+            with tempfile.NamedTemporaryFile(suffix=_suffix, delete=False) as _tmp:
+                _tmp.write(_up.getvalue())
+                _tmp_path = _tmp.name
+            try:
+                from batteries.log_importer import load_log
+                _log = load_log(_tmp_path)
+                _log.source_file = _up.name
+            finally:
+                try:
+                    os.unlink(_tmp_path)
+                except OSError:
+                    pass
+        else:
+            st.warning("Select a log source above.")
+            st.stop()
+
+        from missions.log_to_mission import segment_log
+        with st.spinner("Segmenting log into mission phases..."):
+            try:
+                _raw_segs = segment_log(_log, min_duration_s=lm_min_dur)
+            except ValueError as _ve:
+                st.error(str(_ve))
+                st.stop()
+
+        if not _raw_segs:
+            st.warning("No segments extracted. Ensure MODE messages are present.")
+            st.stop()
+
+        st.session_state["lm_segments"]      = _raw_segs
+        st.session_state["lm_log_name"]      = Path(_log.source_file).stem
+        st.session_state["lm_log_total_s"]   = _log.total_flight_s
+        st.session_state["lm_log_total_mah"] = _log.total_mah
+        st.session_state.pop("lm_pending_merge", None)
+        st.rerun()
+
+    if st.session_state.get("lm_segments"):
+        from missions.log_to_mission import MissionSegment
+
+        segs: list[MissionSegment] = st.session_state["lm_segments"]
+        log_name = st.session_state.get("lm_log_name", "extracted_mission")
+
+        _include_power = (
+            st.session_state.get("lm_import_mode", "Phase + duration + estimated power")
+            == "Phase + duration + estimated power"
+        )
+
+        # ── Summary metrics ──────────────────────────────────────────────────
+        _total_dur_s = sum(s.duration_s for s in segs)
+        _total_wh    = sum(s.energy_wh  for s in segs)
+        _mean_pw     = _total_wh / (_total_dur_s / 3600) if _total_dur_s > 0 else 0
+        _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+        _mc1.metric("Phases",       len(segs))
+        _mc2.metric("Flight time",  f"{_total_dur_s / 60:.1f} min")
+        _mc3.metric("Total energy", f"{_total_wh:.1f} Wh")
+        if _include_power:
+            _mc4.metric("Mean power", f"{_mean_pw:.0f} W")
+        else:
+            _mc4.metric("Mean power", "— (not imported)")
+
+        st.divider()
+
+        # ── Edit table ───────────────────────────────────────────────────────
+        st.markdown("**Edit phase values**")
+        st.caption(
+            "Rename phases, change mode type, and adjust duration."
+            + (" Power values are editable and will be stored on save."
+               if _include_power
+               else " Power column shown as reference only — values will NOT be stored on save.")
+        )
+
+        _edit_rows = []
+        for _s in segs:
+            _edit_rows.append({
+                "seq":            _s.seq,
+                "Phase name":     _s.phase_name,
+                "Mode (type)":    _s.mode_name,
+                "Duration (s)":   round(_s.duration_s, 1),
+                "Mean power (W)": round(_s.mean_power_w, 1),
+                "Energy (Wh)":    round(_s.energy_wh, 3),
+                "Altitude (m)":   round(_s.mean_altitude_m, 1),
+                "Speed (m/s)":    round(_s.mean_speed_ms, 1),
+                "Confidence":     _s.confidence,
+                "Transient":      _s.is_transient,
+                "Notes":          _s.notes,
+            })
+
+        _power_col_config = (
+            st.column_config.NumberColumn("Mean power (W) [reference only]",
+                                          disabled=True, min_value=0.0)
+            if not _include_power
+            else st.column_config.NumberColumn("Mean power (W)", min_value=0.0, step=1.0)
+        )
+
+        _edited_df = st.data_editor(
+            pd.DataFrame(_edit_rows),
+            use_container_width=True,
+            num_rows="fixed",
+            hide_index=True,
+            column_config={
+                "seq":            st.column_config.NumberColumn("Seq", disabled=True, width="small"),
+                "Mode (type)":    st.column_config.SelectboxColumn(
+                                      "Mode (type)", options=_ALL_PHASE_TYPES, required=True,
+                                  ),
+                "Confidence":     st.column_config.SelectboxColumn(
+                                      "Confidence", options=["high", "medium", "low"],
+                                  ),
+                "Transient":      st.column_config.CheckboxColumn("Transient", width="small"),
+                "Duration (s)":   st.column_config.NumberColumn("Duration (s)", min_value=1.0, step=1.0),
+                "Mean power (W)": _power_col_config,
+            },
+            key="lm_edit_df",
+        )
+
+        if _edited_df is not None:
+            _df_dict = {int(row["seq"]): row for _, row in _edited_df.iterrows()}
+            for _s in segs:
+                if _s.seq in _df_dict:
+                    _r = _df_dict[_s.seq]
+                    _s.phase_name   = str(_r.get("Phase name",     _s.phase_name))
+                    _s.mode_name    = str(_r.get("Mode (type)",    _s.mode_name)).upper()
+                    _s.duration_s   = float(_r.get("Duration (s)", _s.duration_s) or _s.duration_s)
+                    _s.mean_power_w = float(_r.get("Mean power (W)", _s.mean_power_w) or _s.mean_power_w)
+                    _s.energy_wh    = float(_r.get("Energy (Wh)",   _s.energy_wh) or _s.energy_wh)
+                    _s.confidence   = str(_r.get("Confidence",      _s.confidence))
+                    _s.is_transient = bool(_r.get("Transient",      _s.is_transient))
+                    _s.notes        = str(_r.get("Notes",           _s.notes))
+
+        # ── Power profile chart ──────────────────────────────────────────────
+        _fig_lm, _ax_lm = plt.subplots(figsize=(10, 3))
+        _bar_labels  = [f"{_s.phase_name}\n{_s.duration_s:.0f}s" for _s in segs]
+        _bar_powers  = [_s.mean_power_w for _s in segs]
+        _bar_colors  = [PHASE_COLORS.get(_s.mode_name.upper(), "#DDDDDD") for _s in segs]
+        _bars_lm = _ax_lm.bar(range(len(segs)), _bar_powers, color=_bar_colors,
+                               edgecolor="#666", linewidth=0.5,
+                               alpha=1.0 if _include_power else 0.45)
+        _ax_lm.set_xticks(range(len(segs)))
+        _ax_lm.set_xticklabels(_bar_labels, fontsize=8)
+        _ax_lm.set_ylabel("Mean power (W)")
+        _ax_lm.set_title(
+            f"Measured power by phase — {log_name}"
+            if _include_power
+            else f"Measured power (reference only, not imported) — {log_name}",
+            fontsize=9,
+        )
+        _ax_lm.grid(axis="y", alpha=0.3)
+        for _bar, _pw in zip(_bars_lm, _bar_powers):
+            if _pw > 0:
+                _ax_lm.text(_bar.get_x() + _bar.get_width() / 2,
+                            _bar.get_height() + 3,
+                            f"{_pw:.0f}W", ha="center", fontsize=7)
+        _fig_lm.tight_layout()
+        st.pyplot(_fig_lm, use_container_width=True)
+        plt.close(_fig_lm)
+
+        st.divider()
+
+        # ── DELETE ───────────────────────────────────────────────────────────
+        st.markdown("**Delete a phase**")
+        _del_opts = {
+            f"Seq {_s.seq}: {_s.phase_name} ({_s.mode_name}, {_s.duration_s:.0f}s)": _s
+            for _s in segs
+        }
+        _del_label = st.selectbox(
+            "Phase to delete", list(_del_opts.keys()),
+            key="lm_del_sel", label_visibility="collapsed"
+        )
+        _del_seg = _del_opts[_del_label]
+        st.write(
+            f"Will delete: **Seq {_del_seg.seq} — {_del_seg.phase_name}** "
+            f"({_del_seg.mode_name}, {_del_seg.duration_s:.0f} s)"
+        )
+        if st.button("🗑️ Confirm delete", key="lm_del_confirm"):
+            _new_segs = [_s for _s in segs if _s.seq != _del_seg.seq]
+            for _i, _s in enumerate(_new_segs, start=1):
+                _s.seq = _i
+            st.session_state["lm_segments"] = _new_segs
+            st.session_state.pop("lm_pending_merge", None)
+            st.rerun()
+
+        st.divider()
+
+        # ── MERGE ────────────────────────────────────────────────────────────
+        st.markdown("**Merge two adjacent phases**")
+        st.caption("Only consecutive phases can be merged.")
+        _seq_labels = {
+            _s.seq: f"Seq {_s.seq}: {_s.phase_name} ({_s.mode_name}, {_s.duration_s:.0f}s)"
+            for _s in segs
+        }
+
+        if len(segs) >= 2:
+            _merge_cols = st.columns([3, 1])
+            with _merge_cols[0]:
+                _merge_sel = st.multiselect(
+                    "Select exactly 2 consecutive phases",
+                    options=[_s.seq for _s in segs],
+                    max_selections=2,
+                    key="lm_merge_sel",
+                    format_func=lambda _sq: _seq_labels[_sq],
+                )
+            with _merge_cols[1]:
+                st.write("")
+                _merge_stage_btn = st.button(
+                    "Stage merge →", key="lm_merge_stage_btn",
+                    disabled=(len(_merge_sel) != 2),
+                )
+
+            if _merge_stage_btn and len(_merge_sel) == 2:
+                _sorted_sel   = sorted(_merge_sel)
+                _current_seqs = [_s.seq for _s in segs]
+                _idx_a = _current_seqs.index(_sorted_sel[0])
+                _idx_b = _current_seqs.index(_sorted_sel[1])
+                if abs(_idx_a - _idx_b) != 1:
+                    st.warning("Only adjacent phases can be merged.")
+                else:
+                    _seg_a   = segs[min(_idx_a, _idx_b)]
+                    _seg_b   = segs[max(_idx_a, _idx_b)]
+                    _dur_tot = _seg_a.duration_s + _seg_b.duration_s
+                    _w_pw    = (
+                        _seg_a.mean_power_w * _seg_a.duration_s
+                        + _seg_b.mean_power_w * _seg_b.duration_s
+                    ) / _dur_tot if _dur_tot > 0 else 0.0
+                    st.session_state["lm_pending_merge"] = {
+                        "seq_a": _seg_a.seq, "seq_b": _seg_b.seq,
+                        "suggested_w": round(_w_pw, 1),
+                    }
+                    st.rerun()
+
+            _pending = st.session_state.get("lm_pending_merge")
+            if _pending:
+                _sa = next((_s for _s in segs if _s.seq == _pending["seq_a"]), None)
+                _sb = next((_s for _s in segs if _s.seq == _pending["seq_b"]), None)
+                if _sa and _sb:
+                    st.info(
+                        f"Merging **Seq {_sa.seq}: {_sa.phase_name}** "
+                        f"({_sa.duration_s:.0f} s)  +  "
+                        f"**Seq {_sb.seq}: {_sb.phase_name}** "
+                        f"({_sb.duration_s:.0f} s)  "
+                        f"→ total {_sa.duration_s + _sb.duration_s:.0f} s"
+                    )
+                    if _include_power:
+                        _pm_cols = st.columns([2, 2, 1])
+                    else:
+                        _pm_cols = st.columns([2, 1])
+
+                    with _pm_cols[0]:
+                        _merged_name = st.text_input(
+                            "Merged phase name", value=_sa.phase_name, key="lm_merge_name"
+                        )
+                    _merged_pw = None
+                    if _include_power:
+                        with _pm_cols[1]:
+                            _merged_pw = st.number_input(
+                                "Power for merged phase (W)",
+                                min_value=0.0, value=float(_pending["suggested_w"]),
+                                step=1.0, key="lm_merge_pw",
+                                help="Duration-weighted mean pre-filled.",
+                            )
+                        _confirm_col = _pm_cols[2]
+                    else:
+                        st.caption("Power not imported — no power value needed for merge.")
+                        _confirm_col = _pm_cols[1]
+
+                    with _confirm_col:
+                        st.write("")
+                        _confirm_merge = st.button(
+                            "✓ Confirm merge", type="primary", key="lm_merge_confirm_btn"
+                        )
+
+                    if st.button("✕ Cancel", key="lm_merge_cancel"):
+                        st.session_state.pop("lm_pending_merge", None)
+                        st.rerun()
+
+                    if _confirm_merge:
+                        _merged_seg = _sa.merge_with(
+                            _sb,
+                            override_power_w=_merged_pw if _include_power else None,
+                        )
+                        _merged_seg.phase_name = _merged_name
+                        _new_segs  = [_s for _s in segs if _s.seq not in (_sa.seq, _sb.seq)]
+                        _insert_at = min(segs.index(_sa), segs.index(_sb))
+                        _new_segs.insert(_insert_at, _merged_seg)
+                        for _i, _s in enumerate(_new_segs, start=1):
+                            _s.seq = _i
+                        st.session_state["lm_segments"] = _new_segs
+                        st.session_state.pop("lm_pending_merge", None)
+                        st.rerun()
+        else:
+            st.caption("Need at least 2 phases to merge.")
+
+        st.divider()
+
+        # ── SAVE ─────────────────────────────────────────────────────────────
+        st.subheader("Save as new mission")
+
+        if _include_power:
+            st.info(
+                "Saving in **Phase + duration + estimated power** mode. "
+                "Measured power values stored as `power_override_w` on high/medium confidence phases."
+            )
+        else:
+            st.info(
+                "Saving in **Phase + duration only** mode. "
+                "No power values stored — equipment model supplies power at simulation time."
+            )
+
+        _save_col1, _save_col2 = st.columns([1, 1])
+        with _save_col1:
+            _default_mid = (
+                st.session_state.get("lm_log_name", "LOG")
+                .upper().replace(" ", "_").replace("-", "_")[:30]
+            )
+            _lm_mission_id = st.text_input("Mission ID *", value=_default_mid, key="lm_mission_id")
+            if _lm_mission_id and _lm_mission_id in db.missions:
+                st.warning(f"`{_lm_mission_id}` already exists — choose a different ID.")
+            _lm_mission_name = st.text_input(
+                "Mission name",
+                value=f"From log: {st.session_state.get('lm_log_name', '')}",
+                key="lm_mission_name",
+            )
+        with _save_col2:
+            _lm_uav_id = st.selectbox(
+                "UAV config *",
+                options=sorted(db.uav_configs.keys()) if db.uav_configs else ["—"],
+                key="lm_uav_id",
+            )
+
+        st.caption(
+            f"{len(segs)} phases · "
+            f"{sum(s.duration_s for s in segs) / 60:.1f} min · "
+            f"UAV: {_lm_uav_id} · "
+            f"Mode: {'power included' if _include_power else 'duration only'}"
+        )
+
+        _save_disabled = (
+            not _lm_mission_id
+            or _lm_mission_id in db.missions
+            or not db.uav_configs
+            or not segs
+        )
+
+        if st.button("💾 Save mission", type="primary", disabled=_save_disabled, key="lm_save_btn"):
+            from missions.log_to_mission import to_mission_phases, save_mission
+
+            _final_phases = to_mission_phases(
+                segs, _lm_mission_id, _lm_mission_name, _lm_uav_id,
+                include_power=_include_power,
+            )
+            try:
+                save_mission(db, _final_phases, _lm_mission_id, _lm_mission_name, _lm_uav_id)
+                reload_db()
+                _power_note = (
+                    "with measured power values"
+                    if _include_power
+                    else "without power values (equipment model will be used)"
+                )
+                st.success(
+                    f"Mission `{_lm_mission_id}` saved with {len(_final_phases)} phases "
+                    f"{_power_note}. Open the Mission Configurator to review and simulate it."
+                )
+                for _k in ("lm_segments", "lm_log_name", "lm_log_total_s",
+                           "lm_log_total_mah", "lm_pending_merge"):
+                    st.session_state.pop(_k, None)
+                st.rerun()
+            except ValueError as _ve:
+                st.error(str(_ve))
+            except Exception as _e:
+                st.error(f"Save failed: {_e}")
+
+    else:
+        st.info(
+            "Use **Log Analysis** tab to load or generate a flight log, then return here "
+            "to extract mission phases from it. Or upload a log file directly above."
+        )
