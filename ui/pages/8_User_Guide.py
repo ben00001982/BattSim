@@ -5,13 +5,9 @@ BattSim User Guide — interactive Streamlit page with PDF download.
 """
 import streamlit as st
 
-from ui.db_helpers import get_db
 from ui.components.user_guide_pdf import generate_user_guide_pdf
 
 st.set_page_config(page_title="User Guide – BattSim", page_icon="📖", layout="wide")
-
-# ── Sidebar DB status ──────────────────────────────────────────────────────────
-db = get_db()
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 st.title("📖 BattSim User Guide")
@@ -319,32 +315,89 @@ st.divider()
 _section("tools", "Tools", "🔧")
 
 st.markdown("""
-**Page 6 — Tools** provides database management utilities.
+**Page 6 — Tools** provides three tabs for building battery packs, validating models, and importing data.
 
-### Tab: Battery Manager
-- **Import from CSV/Excel** — bulk-import battery pack specs from a spreadsheet
-- **Export to CSV** — download the battery database as a CSV file
-- **Merge databases** — combine two `battery_db.xlsx` files
+### Tab: Pack Builder
 
-### Tab: UAV Manager
-- View and edit all UAV configurations in a table
-- Bulk-delete configurations that are no longer needed
+#### Sub-tab: Build from Cell
+Construct a new battery pack by selecting an individual cell from the Cell Catalog and specifying a series/parallel configuration.
 
-### Tab: Mission Manager
-- View all saved missions
-- Delete missions from the database
-- Duplicate a mission under a new ID
+1. **Select a cell** — choose from the Cell Catalog (manufacturer, chemistry, format, capacity)
+2. **Set series (S) and parallel (P)** — defines the pack voltage and capacity
+3. **Weight overhead %** — adds BMS and wiring mass on top of bare cell weight (default 12%)
+4. **Pack ID / Name** — leave blank to auto-generate from the cell and config
+5. **UAV class** and **Notes** — optional metadata
+6. Review the computed specs: voltage, capacity, energy, weight, specific energy, max current, max power, internal resistance
+7. Click **Save to Database** — written directly to `battery_db.xlsx`
 
-### Database File
-All data lives in `battery_db.xlsx`. The file uses named worksheets:
-- `Battery_Packs` — battery specs
-- `Equipment_DB` — UAV equipment profiles
-- `Mission_Profiles` — mission phase data
+#### Sub-tab: Combine Packs
+Connect existing packs together to create a new combined pack entry.
 
-Back up this file regularly, especially before bulk imports or deletes.
+1. Choose **series** (higher voltage) or **parallel** (higher capacity)
+2. Add packs from the dropdown, with a quantity for each
+3. Review the combined pack preview
+4. Click **Save Combined Pack** to write to the database
+
+A **View Cell Catalog** expander at the bottom shows all cells with their full specifications.
+
+### Tab: Model Validation
+Compare FAST, STANDARD, and PRECISE voltage model accuracy against a real flight log.
+
+**Requirements:** A flight log must first be loaded in the **Log Tools** page (upload or generate synthetic). PRECISE mode additionally requires fitted ECM parameters registered via Log Tools.
+
+**Workflow:**
+1. Select battery pack, mission profile, and UAV configuration
+2. Set ambient temperature, initial SoC, Peukert exponent, and cutoff SoC
+3. Choose which model modes to compare (FAST / STANDARD / PRECISE)
+4. Click **Run Validation**
+
+**Results:**
+| Metric | Description |
+|---|---|
+| RMSE (V) | Root mean squared error between simulated and measured voltage |
+| MAE (V) | Mean absolute error |
+| R² | Coefficient of determination (1.0 = perfect fit) |
+| Bias (V) | Systematic over/under-prediction |
+| Points | Number of comparison data points |
+
+A voltage comparison chart overlays simulated vs. measured traces for each model mode.
+
+### Tab: Bulk Data Upload
+
+#### Sub-tab: CSV Bulk Import
+Import multiple battery packs at once from a CSV file.
+
+1. Click **Download CSV Template** to get a pre-filled example with all required columns
+2. Fill in your pack data (one row per pack; `battery_id` must be unique)
+3. Upload the completed CSV
+4. Preview shows detected duplicates and count of new packs to add
+5. Click **Import N packs** to write to the database
+
+Required columns: `battery_id`, `pack_energy_wh`, `pack_weight_g`. All others are optional but recommended.
+
+#### Sub-tab: Web Scraper
+Automatically extract battery specifications from a product or datasheet web page.
+
+1. Paste the target URL and click **Scrape Page**
+2. BattSim fetches the page and extracts tables and key-value patterns (capacity, voltage, weight, energy, cell config, max discharge, chemistry)
+3. Review the auto-extracted specs and any tables found on the page
+4. Map the extracted data to the battery fields, set a Battery ID, and click **Save Scraped Pack to Database**
+
+*Requires: `pip install requests beautifulsoup4`*
+
+#### Sub-tab: PDF Datasheet
+Upload a battery manufacturer PDF datasheet to extract specifications.
+
+1. Upload the PDF file
+2. BattSim extracts all text and tables using `pdfplumber`
+3. Auto-parsed specs (capacity, voltage, weight, energy, cell config, max discharge) are shown
+4. Review the extracted text and tables, correct any fields, then click **Save PDF Pack to Database**
+
+*Requires: `pip install pdfplumber`*
 """)
 
-_tip("Use the Export function to create a backup before making large changes.")
+_tip("The Cell Catalog (visible in the Pack Builder expander) is separate from the Battery Pack catalog — cells are individual cells, packs are assembled multi-cell units.")
+_warn("Battery IDs must be unique across all import methods. Duplicate IDs are skipped automatically during CSV import but will raise an error on individual saves.")
 
 st.divider()
 
